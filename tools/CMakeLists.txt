@@ -1,5 +1,6 @@
 add_subdirectory(bpftimetool)
 add_subdirectory(cli)
+add_subdirectory(pgas_preload)
 if(BPFTIME_LLVM_JIT)
   message(STATUS "Using llvm-jit")
   add_subdirectory(aot)

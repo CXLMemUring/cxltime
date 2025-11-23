@@ -243,6 +243,7 @@ add_subdirectory(tools)
 
 if(${BUILD_ATTACH_IMPL_EXAMPLE})
   add_subdirectory(example/attach_implementation)
+  add_subdirectory(example/pgas_memory_hook)
 endif()
 
 # benchmark that requires bpftime libraries
