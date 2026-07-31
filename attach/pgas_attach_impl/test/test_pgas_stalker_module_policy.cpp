@@ -63,6 +63,9 @@ TEST_CASE("main executable and exact allowlist basenames are instrumented",
     const auto unseen = policy.requested_but_unseen();
     REQUIRE(unseen.size() == 1);
     REQUIRE(unseen[0] == "libllama.so");
+    REQUIRE(policy.requested() ==
+            std::vector<std::string>{ "libggml.so", "libllama.so" });
+    REQUIRE(policy.observed() == std::vector<std::string>{ "libggml.so" });
 }
 
 TEST_CASE("hard-denied modules cannot be re-enabled",

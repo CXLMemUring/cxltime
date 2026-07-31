@@ -15,6 +15,8 @@ class pgas_stalker_module_policy {
 
     bool may_instrument(std::string_view basename, bool is_main) const;
     bool should_instrument(std::string_view basename, bool is_main);
+    std::vector<std::string> requested() const;
+    std::vector<std::string> observed() const;
     std::vector<std::string> requested_but_unseen() const;
 
   private:

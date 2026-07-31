@@ -98,6 +98,22 @@ bool pgas_stalker_module_policy::may_instrument(std::string_view basename,
            requested_.end();
 }
 
+std::vector<std::string> pgas_stalker_module_policy::requested() const
+{
+    return requested_;
+}
+
+std::vector<std::string> pgas_stalker_module_policy::observed() const
+{
+    std::lock_guard lock(mutex_);
+    std::vector<std::string> result;
+    for (const auto &module : requested_) {
+        if (observed_.contains(module))
+            result.push_back(module);
+    }
+    return result;
+}
+
 std::vector<std::string>
 pgas_stalker_module_policy::requested_but_unseen() const
 {

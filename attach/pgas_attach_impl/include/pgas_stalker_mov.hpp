@@ -52,6 +52,11 @@ typedef struct {
     uint64_t remote_loads;         // Actual remote loads executed
     uint64_t remote_stores;        // Actual remote stores executed
     uint64_t local_passthrough;    // Local accesses (no-op callout)
+    uint64_t translated_reads;
+    uint64_t translated_writes;
+    uint64_t translated_read_modify_writes;
+    uint64_t translated_prefetches;
+    uint64_t translated_unsupported;
 } pgas_stalker_stats_t;
 
 typedef struct {
@@ -67,6 +72,12 @@ typedef struct {
     uint64_t follow_events;
     uint64_t unfollow_events;
 } pgas_stalker_thread_stats_t;
+
+typedef struct {
+    uint64_t pre_ready_application_threads;
+    uint64_t internal_creator_threads;
+    uint64_t unfollowed_application_threads;
+} pgas_stalker_lifecycle_stats_t;
 
 // Initialize stalker context (call after gum_init_embedded())
 pgas_stalker_ctx_t *pgas_stalker_init(const pgas_stalker_config_t *config);
@@ -113,6 +124,9 @@ int pgas_stalker_strict_valid(pgas_stalker_ctx_t *ctx);
 
 // Print statistics
 void pgas_stalker_print_stats(pgas_stalker_ctx_t *ctx);
+void pgas_stalker_print_json(
+    pgas_stalker_ctx_t *ctx,
+    const pgas_stalker_lifecycle_stats_t *lifecycle);
 
 // Cleanup
 void pgas_stalker_finalize(pgas_stalker_ctx_t *ctx);

@@ -29,6 +29,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include <dlfcn.h>
@@ -913,6 +914,28 @@ static void transform_block(GumStalkerIterator *iterator,
         cd->descriptor = descriptor;
 
         emit_memory_access(iterator, output, cd);
+        switch (descriptor.access_class) {
+        case pgas_x86_access_class::read:
+            __atomic_fetch_add(&ctx->stats.translated_reads, 1,
+                               __ATOMIC_RELAXED);
+            break;
+        case pgas_x86_access_class::write:
+            __atomic_fetch_add(&ctx->stats.translated_writes, 1,
+                               __ATOMIC_RELAXED);
+            break;
+        case pgas_x86_access_class::read_modify_write:
+            __atomic_fetch_add(&ctx->stats.translated_read_modify_writes, 1,
+                               __ATOMIC_RELAXED);
+            break;
+        case pgas_x86_access_class::prefetch:
+            __atomic_fetch_add(&ctx->stats.translated_prefetches, 1,
+                               __ATOMIC_RELAXED);
+            break;
+        case pgas_x86_access_class::unsupported:
+            __atomic_fetch_add(&ctx->stats.translated_unsupported, 1,
+                               __ATOMIC_RELAXED);
+            break;
+        }
         if (descriptor.access_class == pgas_x86_access_class::read) {
             __atomic_fetch_add(&ctx->stats.mov_loads_hooked, 1, __ATOMIC_RELAXED);
         } else if (descriptor.access_class == pgas_x86_access_class::write) {
@@ -1116,26 +1139,162 @@ void pgas_stalker_print_stats(pgas_stalker_ctx_t *ctx) {
     uint64_t total_hooked = s.mov_loads_hooked + s.mov_stores_hooked;
     uint64_t total_runtime = s.remote_loads + s.remote_stores + s.local_passthrough;
 
-    printf("\n=== PGAS Stalker MOV Statistics ===\n");
-    printf("JIT phase:\n");
-    printf("  Blocks transformed:   %lu\n", s.blocks_transformed);
-    printf("  Instructions scanned: %lu\n", s.insns_scanned);
-    printf("  MOV loads hooked:     %lu\n", s.mov_loads_hooked);
-    printf("  MOV stores hooked:    %lu\n", s.mov_stores_hooked);
-    printf("  Instrumentation rate: %.1f%%\n",
+    fprintf(stderr, "\n=== PGAS Stalker MOV Statistics ===\n");
+    fprintf(stderr, "JIT phase:\n");
+    fprintf(stderr, "  Blocks transformed:   %lu\n", s.blocks_transformed);
+    fprintf(stderr, "  Instructions scanned: %lu\n", s.insns_scanned);
+    fprintf(stderr, "  MOV loads hooked:     %lu\n", s.mov_loads_hooked);
+    fprintf(stderr, "  MOV stores hooked:    %lu\n", s.mov_stores_hooked);
+    fprintf(stderr, "  Instrumentation rate: %.1f%%\n",
            s.insns_scanned ? 100.0 * total_hooked / s.insns_scanned : 0);
-    printf("Runtime:\n");
-    printf("  Callouts fired:       %lu\n", total_runtime);
-    printf("  Remote loads:         %lu\n", s.remote_loads);
-    printf("  Remote stores:        %lu\n", s.remote_stores);
-    printf("  Local passthrough:    %lu\n", s.local_passthrough);
-    printf("  Callout pool used:    %lu / %d\n",
+    fprintf(stderr, "Runtime:\n");
+    fprintf(stderr, "  Callouts fired:       %lu\n", total_runtime);
+    fprintf(stderr, "  Remote loads:         %lu\n", s.remote_loads);
+    fprintf(stderr, "  Remote stores:        %lu\n", s.remote_stores);
+    fprintf(stderr, "  Local passthrough:    %lu\n", s.local_passthrough);
+    fprintf(stderr, "  Callout pool used:    %lu / %d\n",
            g_callout_pool_next, CALLOUT_POOL_CAPACITY);
     const auto unseen = ctx->module_policy->requested_but_unseen();
     for (const auto &module : unseen)
-        printf("requested_include_unseen=%s\n", module.c_str());
-    printf("strict_valid=%d\n", pgas_stalker_strict_valid(ctx));
-    printf("==================================\n\n");
+        fprintf(stderr, "requested_include_unseen=%s\n", module.c_str());
+    fprintf(stderr, "strict_valid=%d\n", pgas_stalker_strict_valid(ctx));
+    fprintf(stderr, "==================================\n\n");
+}
+
+namespace {
+
+void append_json_string(std::string &output, std::string_view value)
+{
+    output.push_back('"');
+    constexpr char hex[] = "0123456789abcdef";
+    for (const unsigned char character : value) {
+        switch (character) {
+        case '"': output += "\\\""; break;
+        case '\\': output += "\\\\"; break;
+        case '\b': output += "\\b"; break;
+        case '\f': output += "\\f"; break;
+        case '\n': output += "\\n"; break;
+        case '\r': output += "\\r"; break;
+        case '\t': output += "\\t"; break;
+        default:
+            if (character < 0x20) {
+                output += "\\u00";
+                output.push_back(hex[character >> 4]);
+                output.push_back(hex[character & 0xf]);
+            } else {
+                output.push_back(static_cast<char>(character));
+            }
+        }
+    }
+    output.push_back('"');
+}
+
+void append_json_string_array(std::string &output,
+                              const std::vector<std::string> &values)
+{
+    output.push_back('[');
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0)
+            output.push_back(',');
+        append_json_string(output, values[i]);
+    }
+    output.push_back(']');
+}
+
+void write_stdout(const std::string &output)
+{
+    size_t offset{};
+    while (offset < output.size()) {
+        const ssize_t written = write(STDOUT_FILENO, output.data() + offset,
+                                      output.size() - offset);
+        if (written <= 0)
+            return;
+        offset += static_cast<size_t>(written);
+    }
+}
+
+} // namespace
+
+void pgas_stalker_print_json(
+    pgas_stalker_ctx_t *ctx,
+    const pgas_stalker_lifecycle_stats_t *lifecycle)
+{
+    if (ctx == nullptr)
+        return;
+    std::vector<pgas_stalker_thread_stats_t> threads(
+        pgas_stalker_snapshot_threads(ctx, nullptr, 0));
+    pgas_stalker_snapshot_threads(ctx, threads.data(), threads.size());
+    std::ranges::sort(threads, {},
+                      &pgas_stalker_thread_stats_t::runtime_id);
+
+    pgas_stalker_thread_stats_t totals{};
+    std::string output;
+    for (const auto &thread : threads) {
+        output += "{\"kind\":\"pgas_stalker_thread\",\"runtime_id\":" +
+                  std::to_string(thread.runtime_id) +
+                  ",\"os_tid\":" + std::to_string(thread.os_tid) +
+                  ",\"remote_loads\":" + std::to_string(thread.remote_loads) +
+                  ",\"remote_stores\":" + std::to_string(thread.remote_stores) +
+                  ",\"bytes_read\":" + std::to_string(thread.bytes_read) +
+                  ",\"bytes_written\":" + std::to_string(thread.bytes_written) +
+                  ",\"cross_line_splits\":" +
+                  std::to_string(thread.cross_line_splits) +
+                  ",\"unsupported\":" + std::to_string(thread.unsupported) +
+                  ",\"failures\":" + std::to_string(thread.failures) +
+                  ",\"follow_events\":" + std::to_string(thread.follow_events) +
+                  ",\"unfollow_events\":" +
+                  std::to_string(thread.unfollow_events) + "}\n";
+        totals.remote_loads += thread.remote_loads;
+        totals.remote_stores += thread.remote_stores;
+        totals.bytes_read += thread.bytes_read;
+        totals.bytes_written += thread.bytes_written;
+        totals.cross_line_splits += thread.cross_line_splits;
+        totals.unsupported += thread.unsupported;
+        totals.failures += thread.failures;
+        totals.follow_events += thread.follow_events;
+        totals.unfollow_events += thread.unfollow_events;
+    }
+
+    const pgas_stalker_lifecycle_stats_t empty_lifecycle{};
+    const auto &life = lifecycle == nullptr ? empty_lifecycle : *lifecycle;
+    const bool strict_valid =
+        pgas_stalker_strict_valid(ctx) != 0 &&
+        life.pre_ready_application_threads == 0 &&
+        life.unfollowed_application_threads == 0;
+    output += "{\"kind\":\"pgas_stalker_summary\",\"threads\":" +
+              std::to_string(threads.size()) +
+              ",\"remote_loads\":" + std::to_string(totals.remote_loads) +
+              ",\"remote_stores\":" + std::to_string(totals.remote_stores) +
+              ",\"bytes_read\":" + std::to_string(totals.bytes_read) +
+              ",\"bytes_written\":" + std::to_string(totals.bytes_written) +
+              ",\"cross_line_splits\":" +
+              std::to_string(totals.cross_line_splits) +
+              ",\"unsupported\":" + std::to_string(totals.unsupported) +
+              ",\"failures\":" + std::to_string(totals.failures) +
+              ",\"follow_events\":" + std::to_string(totals.follow_events) +
+              ",\"unfollow_events\":" + std::to_string(totals.unfollow_events) +
+              ",\"requested_modules\":";
+    append_json_string_array(output, ctx->module_policy->requested());
+    output += ",\"observed_modules\":";
+    append_json_string_array(output, ctx->module_policy->observed());
+    output += ",\"pre_ready_application_threads\":" +
+              std::to_string(life.pre_ready_application_threads) +
+              ",\"internal_creator_threads\":" +
+              std::to_string(life.internal_creator_threads) +
+              ",\"unfollowed_application_threads\":" +
+              std::to_string(life.unfollowed_application_threads) +
+              ",\"translated_access_classes\":{\"read\":" +
+              std::to_string(ctx->stats.translated_reads) +
+              ",\"write\":" + std::to_string(ctx->stats.translated_writes) +
+              ",\"read_modify_write\":" +
+              std::to_string(ctx->stats.translated_read_modify_writes) +
+              ",\"prefetch\":" +
+              std::to_string(ctx->stats.translated_prefetches) +
+              ",\"unsupported\":" +
+              std::to_string(ctx->stats.translated_unsupported) +
+              "},\"strict_valid\":" + (strict_valid ? "true" : "false") +
+              "}\n";
+    write_stdout(output);
 }
 
 void pgas_stalker_finalize(pgas_stalker_ctx_t *ctx) {
@@ -1600,6 +1759,11 @@ void pgas_stalker_print_stats(pgas_stalker_ctx_t *ctx) {
     printf("===============================================\n\n");
 }
 
+void pgas_stalker_print_json(
+    pgas_stalker_ctx_t *, const pgas_stalker_lifecycle_stats_t *)
+{
+}
+
 void pgas_stalker_finalize(pgas_stalker_ctx_t *ctx) {
     if (!ctx) return;
     if (ctx->stalker) {
@@ -1654,6 +1818,8 @@ void pgas_stalker_get_stats(pgas_stalker_ctx_t *ctx, pgas_stalker_stats_t *stats
     if (stats) memset(stats, 0, sizeof(*stats));
 }
 void pgas_stalker_print_stats(pgas_stalker_ctx_t *ctx) { (void)ctx; }
+void pgas_stalker_print_json(
+    pgas_stalker_ctx_t *, const pgas_stalker_lifecycle_stats_t *) {}
 void pgas_stalker_finalize(pgas_stalker_ctx_t *ctx) { (void)ctx; }
 
 } // extern "C"

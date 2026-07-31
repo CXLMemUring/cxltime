@@ -91,6 +91,10 @@ void pgas_stalker_print_stats(pgas_stalker_ctx_t *ctx) {
     (void)ctx;
 }
 
+void pgas_stalker_print_json(
+    pgas_stalker_ctx_t *, const pgas_stalker_lifecycle_stats_t *) {
+}
+
 void pgas_stalker_finalize(pgas_stalker_ctx_t *ctx) {
     (void)ctx;
 }
