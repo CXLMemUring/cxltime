@@ -79,6 +79,10 @@ int pgas_stalker_should_follow_creator(pgas_stalker_ctx_t *, const char *) {
     return 0;
 }
 
+int pgas_stalker_may_instrument_module(pgas_stalker_ctx_t *, const char *) {
+    return 0;
+}
+
 int pgas_stalker_strict_valid(pgas_stalker_ctx_t *) {
     return 0;
 }

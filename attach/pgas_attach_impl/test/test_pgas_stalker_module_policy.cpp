@@ -56,6 +56,7 @@ TEST_CASE("main executable and exact allowlist basenames are instrumented",
 
     REQUIRE(policy.should_instrument("splash-llm", true));
     REQUIRE(policy.should_instrument("libggml.so", false));
+    REQUIRE(policy.may_instrument("libllama.so", false));
     REQUIRE_FALSE(policy.should_instrument("libggml-extra.so", false));
     REQUIRE_FALSE(policy.should_instrument("libother.so", false));
 

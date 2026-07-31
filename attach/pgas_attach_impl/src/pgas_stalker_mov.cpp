@@ -1028,6 +1028,18 @@ int pgas_stalker_should_follow_creator(pgas_stalker_ctx_t *ctx,
                : 0;
 }
 
+int pgas_stalker_may_instrument_module(pgas_stalker_ctx_t *ctx,
+                                       const char *module_path)
+{
+    if (ctx == nullptr || ctx->module_policy == nullptr)
+        return 0;
+    const std::string basename = basename_from_path(module_path);
+    return ctx->module_policy->may_instrument(
+               basename, is_main_module(ctx, basename))
+               ? 1
+               : 0;
+}
+
 int pgas_stalker_strict_valid(pgas_stalker_ctx_t *ctx)
 {
     if (ctx == nullptr)
@@ -1068,6 +1080,10 @@ void pgas_stalker_print_stats(pgas_stalker_ctx_t *ctx) {
     printf("  Local passthrough:    %lu\n", s.local_passthrough);
     printf("  Callout pool used:    %lu / %d\n",
            g_callout_pool_next, CALLOUT_POOL_CAPACITY);
+    const auto unseen = ctx->module_policy->requested_but_unseen();
+    for (const auto &module : unseen)
+        printf("requested_include_unseen=%s\n", module.c_str());
+    printf("strict_valid=%d\n", pgas_stalker_strict_valid(ctx));
     printf("==================================\n\n");
 }
 

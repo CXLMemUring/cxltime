@@ -13,6 +13,7 @@ class pgas_stalker_module_policy {
   public:
     explicit pgas_stalker_module_policy(std::string_view csv);
 
+    bool may_instrument(std::string_view basename, bool is_main) const;
     bool should_instrument(std::string_view basename, bool is_main);
     std::vector<std::string> requested_but_unseen() const;
 

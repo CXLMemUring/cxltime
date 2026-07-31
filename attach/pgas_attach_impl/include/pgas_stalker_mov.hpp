@@ -105,6 +105,8 @@ size_t pgas_stalker_snapshot_threads(pgas_stalker_ctx_t *ctx,
 // Apply the same exact-basename policy used by translated code to a creator.
 int pgas_stalker_should_follow_creator(pgas_stalker_ctx_t *ctx,
                                        const char *module_path);
+int pgas_stalker_may_instrument_module(pgas_stalker_ctx_t *ctx,
+                                       const char *module_path);
 
 // Return nonzero when strict coverage and per-thread invariants are valid.
 int pgas_stalker_strict_valid(pgas_stalker_ctx_t *ctx);

@@ -75,7 +75,7 @@ pgas_stalker_module_policy::pgas_stalker_module_policy(std::string_view csv)
 bool pgas_stalker_module_policy::should_instrument(std::string_view basename,
                                                    bool is_main)
 {
-    if (is_hard_denied(basename))
+    if (!may_instrument(basename, is_main))
         return false;
     if (is_main)
         return true;
@@ -83,11 +83,19 @@ bool pgas_stalker_module_policy::should_instrument(std::string_view basename,
     std::lock_guard lock(mutex_);
     const auto requested =
         std::find(requested_.begin(), requested_.end(), basename);
-    if (requested == requested_.end())
-        return false;
-
     observed_.insert(*requested);
     return true;
+}
+
+bool pgas_stalker_module_policy::may_instrument(std::string_view basename,
+                                                bool is_main) const
+{
+    if (is_hard_denied(basename))
+        return false;
+    if (is_main)
+        return true;
+    return std::find(requested_.begin(), requested_.end(), basename) !=
+           requested_.end();
 }
 
 std::vector<std::string>
