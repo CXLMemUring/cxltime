@@ -6,6 +6,7 @@
 #define _PGAS_CXLMEMSIM_INTEGRATION_HPP
 
 #include "pgas_attach_impl.hpp"
+#include "pgas_x86_memory_access.hpp"
 #include "cxlmemsim_client.h"
 #include <memory>
 #include <unordered_map>
@@ -46,6 +47,8 @@ public:
         uint64_t local_writes = 0;
         uint64_t remote_reads = 0;
         uint64_t remote_writes = 0;
+        uint64_t remote_bytes_read = 0;
+        uint64_t remote_bytes_written = 0;
         uint64_t total_remote_latency_ns = 0;
     };
 
@@ -173,6 +176,8 @@ cxlmemsim_connection_manager::stats get_stats();
 void finalize();
 
 } // namespace hooks
+
+pgas_x86_transport pgas_cxlmemsim_x86_transport();
 
 } // namespace attach
 } // namespace bpftime

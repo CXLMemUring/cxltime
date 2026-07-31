@@ -241,9 +241,10 @@ int pgas_cxlmemsim_hooker::remote_read(uint16_t node_id, uint64_t addr,
 
     uint64_t remote_addr = translate_addr(addr, node_id);
     int ret = cxlmemsim_remote_load(ctx, remote_addr, dest, size);
-    {
+    if (ret == 0) {
         std::lock_guard<std::mutex> lock(conn_mgr.stats_mutex_);
         conn_mgr.stats_.remote_reads++;
+        conn_mgr.stats_.remote_bytes_read += size;
         conn_mgr.stats_.total_remote_latency_ns += ctx->total_latency_ns;
     }
     return ret;
@@ -272,9 +273,10 @@ int pgas_cxlmemsim_hooker::remote_write(uint16_t node_id, uint64_t addr,
 
     uint64_t remote_addr = translate_addr(addr, node_id);
     int ret = cxlmemsim_remote_store(ctx, remote_addr, src, size);
-    {
+    if (ret == 0) {
         std::lock_guard<std::mutex> lock(conn_mgr.stats_mutex_);
         conn_mgr.stats_.remote_writes++;
+        conn_mgr.stats_.remote_bytes_written += size;
         conn_mgr.stats_.total_remote_latency_ns += ctx->total_latency_ns;
     }
     return ret;
@@ -526,6 +528,29 @@ void finalize() {
 }
 
 } // namespace hooks
+
+namespace {
+
+int x86_transport_read(void *, uint16_t node, uint64_t address, void *dest,
+                       size_t size)
+{
+    return pgas_cxlmemsim_hooker::instance().remote_read(node, address, dest,
+                                                         size);
+}
+
+int x86_transport_write(void *, uint16_t node, uint64_t address,
+                        const void *source, size_t size)
+{
+    return pgas_cxlmemsim_hooker::instance().remote_write(
+        node, address, source, size);
+}
+
+} // namespace
+
+pgas_x86_transport pgas_cxlmemsim_x86_transport()
+{
+    return { x86_transport_read, x86_transport_write, nullptr };
+}
 
 } // namespace attach
 } // namespace bpftime
