@@ -67,6 +67,12 @@ bool bpftime::attach::pgas_x86_emit_range_gate(
     const auto overflow_restore = GSIZE_TO_POINTER(label_base + 3);
     const uint64_t pgas_end = pgas_base + pgas_size;
 
+    // Leaf functions may keep live locals in the SysV 128-byte red zone.
+    // Move below it before saving state; LEA preserves the caller's flags.
+    if (!gum_x86_writer_put_lea_reg_reg_offset(writer, GUM_X86_RSP,
+                                               GUM_X86_RSP, -128)) {
+        return false;
+    }
     gum_x86_writer_put_pushfx(writer);
     if (!gum_x86_writer_put_push_reg(writer, scratch_start) ||
         !gum_x86_writer_put_push_reg(writer, scratch_end) ||
@@ -119,6 +125,10 @@ bool bpftime::attach::pgas_x86_emit_range_gate(
             return false;
         }
         gum_x86_writer_put_popfx(writer);
+        if (!gum_x86_writer_put_lea_reg_reg_offset(writer, GUM_X86_RSP,
+                                                   GUM_X86_RSP, 128)) {
+            return false;
+        }
         gum_x86_writer_put_jmp_near_label(writer, target_label);
         return true;
     };
@@ -149,6 +159,7 @@ struct pgas_stalker_ctx {
     std::mutex module_cache_mutex;
     std::unordered_map<uintptr_t, bool> module_cache;
     std::mutex thread_mutex;
+    std::mutex lifecycle_mutex;
     std::vector<std::unique_ptr<stalker_thread_record>> threads;
     uint64_t next_runtime_id;
 
@@ -933,6 +944,7 @@ pgas_stalker_ctx_t *pgas_stalker_init(const pgas_stalker_config_t *config) {
 
 int pgas_stalker_follow_me(pgas_stalker_ctx_t *ctx) {
     if (!ctx || !ctx->stalker) return -1;
+    std::lock_guard lifecycle_lock(ctx->lifecycle_mutex);
     register_current_thread(ctx);
     gum_stalker_follow_me(ctx->stalker, ctx->transformer, NULL);
     ctx->active = true;
@@ -942,6 +954,7 @@ int pgas_stalker_follow_me(pgas_stalker_ctx_t *ctx) {
 
 int pgas_stalker_follow(pgas_stalker_ctx_t *ctx, GumThreadId thread_id) {
     if (!ctx || !ctx->stalker) return -1;
+    std::lock_guard lifecycle_lock(ctx->lifecycle_mutex);
     create_thread_record(ctx, static_cast<uint64_t>(thread_id));
     gum_stalker_follow(ctx->stalker, thread_id, ctx->transformer, NULL);
     ctx->active = true;
@@ -951,6 +964,7 @@ int pgas_stalker_follow(pgas_stalker_ctx_t *ctx, GumThreadId thread_id) {
 
 void pgas_stalker_unfollow_me(pgas_stalker_ctx_t *ctx) {
     if (!ctx || !ctx->stalker) return;
+    std::lock_guard lifecycle_lock(ctx->lifecycle_mutex);
     gum_stalker_unfollow_me(ctx->stalker);
     unregister_current_thread(ctx);
     SPDLOG_INFO("Stalker unfollowed current thread");
@@ -958,6 +972,7 @@ void pgas_stalker_unfollow_me(pgas_stalker_ctx_t *ctx) {
 
 void pgas_stalker_unfollow(pgas_stalker_ctx_t *ctx, GumThreadId thread_id) {
     if (!ctx || !ctx->stalker) return;
+    std::lock_guard lifecycle_lock(ctx->lifecycle_mutex);
     gum_stalker_unfollow(ctx->stalker, thread_id);
     unregister_thread_id(ctx, static_cast<uint64_t>(thread_id));
 }

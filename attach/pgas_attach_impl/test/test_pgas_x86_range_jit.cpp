@@ -19,6 +19,7 @@ struct call_state {
     uint64_t r11{};
     uint64_t r12{};
     uint64_t flags{};
+    uint64_t red_zone{};
 };
 
 call_state call_preserving_state(range_function function, uint64_t address)
@@ -27,6 +28,7 @@ call_state call_preserving_state(range_function function, uint64_t address)
     constexpr uint64_t sentinel_r11 = 0x1111111111111111ULL;
     constexpr uint64_t sentinel_r12 = 0x1212121212121212ULL;
     constexpr uint64_t input_flags = 0x246;
+    constexpr uint64_t red_zone_sentinel = 0xfeedfacecafebeefULL;
     call_state state{};
 
     asm volatile(
@@ -35,6 +37,9 @@ call_state call_preserving_state(range_function function, uint64_t address)
         "mov %[sentinel_r10], %%r10\n\t"
         "mov %[sentinel_r11], %%r11\n\t"
         "mov %[sentinel_r12], %%r12\n\t"
+        "mov %[input_flags], %%rax\n\t"
+        "mov %[red_zone_sentinel], %%rax\n\t"
+        "mov %%rax, -16(%%rsp)\n\t"
         "mov %[input_flags], %%rax\n\t"
         "push %%rax\n\t"
         "popfq\n\t"
@@ -46,14 +51,17 @@ call_state call_preserving_state(range_function function, uint64_t address)
         "mov %%r10, %[r10]\n\t"
         "mov %%r11, %[r11]\n\t"
         "mov %%r12, %[r12]\n\t"
+        "mov -16(%%rsp), %%rax\n\t"
+        "mov %%rax, %[red_zone]\n\t"
         : [result] "=m"(state.result), [flags] "=m"(state.flags),
           [r10] "=m"(state.r10), [r11] "=m"(state.r11),
-          [r12] "=m"(state.r12)
+          [r12] "=m"(state.r12), [red_zone] "=m"(state.red_zone)
         : [function] "r"(function), [address] "r"(address),
           [sentinel_r10] "r"(sentinel_r10),
           [sentinel_r11] "r"(sentinel_r11),
           [sentinel_r12] "r"(sentinel_r12),
-          [input_flags] "r"(input_flags)
+          [input_flags] "r"(input_flags),
+          [red_zone_sentinel] "r"(red_zone_sentinel)
         : "rax", "rdi", "r10", "r11", "r12", "r13", "memory", "cc");
 
     return state;
@@ -71,6 +79,7 @@ TEST_CASE("generated x86 range gate preserves 64-bit bounds and state",
     constexpr uint64_t sentinel_r10 = 0x1010101010101010ULL;
     constexpr uint64_t sentinel_r11 = 0x1111111111111111ULL;
     constexpr uint64_t sentinel_r12 = 0x1212121212121212ULL;
+    constexpr uint64_t red_zone_sentinel = 0xfeedfacecafebeefULL;
 
     gum_init_embedded();
     auto *code = static_cast<uint8_t *>(gum_alloc_n_pages(1, GUM_PAGE_RWX));
@@ -119,6 +128,7 @@ TEST_CASE("generated x86 range gate preserves 64-bit bounds and state",
         REQUIRE(state.r10 == sentinel_r10);
         REQUIRE(state.r11 == sentinel_r11);
         REQUIRE(state.r12 == sentinel_r12);
+        REQUIRE(state.red_zone == red_zone_sentinel);
         REQUIRE((state.flags & arithmetic_flags_mask) ==
                 (expected_flags & arithmetic_flags_mask));
     }
