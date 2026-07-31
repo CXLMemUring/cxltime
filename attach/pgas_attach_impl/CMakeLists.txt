@@ -126,6 +126,24 @@ if(BUILD_TESTING)
     add_test(NAME test_pgas_stalker_module_policy
         COMMAND test_pgas_stalker_module_policy)
 
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)$")
+        add_executable(test_pgas_x86_range_jit
+            test/test_pgas_x86_range_jit.cpp
+        )
+
+        target_link_libraries(test_pgas_x86_range_jit
+            bpftime_pgas_attach_impl
+            Catch2::Catch2WithMain
+        )
+
+        target_include_directories(test_pgas_x86_range_jit PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+        )
+
+        add_test(NAME test_pgas_x86_range_jit
+            COMMAND test_pgas_x86_range_jit)
+    endif()
+
     # CXLMemSim hook test (standalone, requires CXLMemSim server)
     add_executable(test_cxlmemsim_hook
         test/test_cxlmemsim_hook.cpp

@@ -14,17 +14,112 @@
 
 #include "pgas_stalker_mov.hpp"
 #include "pgas_cxlmemsim_integration.hpp"
+#include "pgas_x86_memory_access.hpp"
 #include <spdlog/spdlog.h>
+#include <array>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
 #include <vector>
 #include <mutex>
-#include <limits>
+#include <atomic>
+#include <cerrno>
+
+#include <unistd.h>
 
 using namespace bpftime::attach;
 
 #if defined(__x86_64__)
+
+bool bpftime::attach::pgas_x86_emit_range_gate(
+    GumX86Writer *writer, GumX86Reg address_register,
+    GumX86Reg scratch_start, GumX86Reg scratch_end,
+    GumX86Reg scratch_bound, int64_t displacement, uint8_t width,
+    uint64_t pgas_base,
+    uint64_t pgas_size, gconstpointer inside_label,
+    gconstpointer outside_label, gconstpointer partial_label,
+    gconstpointer overflow_label)
+{
+    if (writer == nullptr || inside_label == nullptr ||
+        outside_label == nullptr || partial_label == nullptr ||
+        overflow_label == nullptr || width == 0 || width > 64 ||
+        pgas_size == 0 || pgas_base > UINT64_MAX - pgas_size ||
+        address_register == scratch_start ||
+        address_register == scratch_end ||
+        address_register == scratch_bound || scratch_start == scratch_end ||
+        scratch_start == scratch_bound || scratch_end == scratch_bound) {
+        return false;
+    }
+
+    static std::atomic<uintptr_t> next_label{ 0x1000 };
+    const auto label_base = next_label.fetch_add(4, std::memory_order_relaxed);
+    const auto inside_restore = GSIZE_TO_POINTER(label_base);
+    const auto outside_restore = GSIZE_TO_POINTER(label_base + 1);
+    const auto partial_restore = GSIZE_TO_POINTER(label_base + 2);
+    const auto overflow_restore = GSIZE_TO_POINTER(label_base + 3);
+    const uint64_t pgas_end = pgas_base + pgas_size;
+
+    gum_x86_writer_put_pushfx(writer);
+    if (!gum_x86_writer_put_push_reg(writer, scratch_start) ||
+        !gum_x86_writer_put_push_reg(writer, scratch_end) ||
+        !gum_x86_writer_put_push_reg(writer, scratch_bound) ||
+        !gum_x86_writer_put_mov_reg_reg(writer, scratch_start,
+                                        address_register) ||
+        (displacement != 0 &&
+         !gum_x86_writer_put_add_reg_imm(writer, scratch_start,
+                                         displacement)) ||
+        !gum_x86_writer_put_mov_reg_reg(writer, scratch_end, scratch_start) ||
+        !gum_x86_writer_put_add_reg_imm(writer, scratch_end, width)) {
+        return false;
+    }
+    gum_x86_writer_put_jcc_near_label(writer, X86_INS_JB, overflow_restore,
+                                      GUM_NO_HINT);
+
+    if (!gum_x86_writer_put_mov_reg_u64(writer, scratch_bound, pgas_base) ||
+        !gum_x86_writer_put_cmp_reg_reg(writer, scratch_end, scratch_bound)) {
+        return false;
+    }
+    gum_x86_writer_put_jcc_near_label(writer, X86_INS_JBE, outside_restore,
+                                      GUM_NO_HINT);
+    if (!gum_x86_writer_put_cmp_reg_reg(writer, scratch_start,
+                                        scratch_bound)) {
+        return false;
+    }
+    gum_x86_writer_put_jcc_near_label(writer, X86_INS_JB, partial_restore,
+                                      GUM_NO_HINT);
+
+    if (!gum_x86_writer_put_mov_reg_u64(writer, scratch_bound, pgas_end) ||
+        !gum_x86_writer_put_cmp_reg_reg(writer, scratch_start,
+                                        scratch_bound)) {
+        return false;
+    }
+    gum_x86_writer_put_jcc_near_label(writer, X86_INS_JAE, outside_restore,
+                                      GUM_NO_HINT);
+    if (!gum_x86_writer_put_cmp_reg_reg(writer, scratch_end, scratch_bound)) {
+        return false;
+    }
+    gum_x86_writer_put_jcc_near_label(writer, X86_INS_JA, partial_restore,
+                                      GUM_NO_HINT);
+    gum_x86_writer_put_jmp_near_label(writer, inside_restore);
+
+    const auto emit_restore = [&](gconstpointer restore_label,
+                                  gconstpointer target_label) {
+        if (!gum_x86_writer_put_label(writer, restore_label) ||
+            !gum_x86_writer_put_pop_reg(writer, scratch_bound) ||
+            !gum_x86_writer_put_pop_reg(writer, scratch_end) ||
+            !gum_x86_writer_put_pop_reg(writer, scratch_start)) {
+            return false;
+        }
+        gum_x86_writer_put_popfx(writer);
+        gum_x86_writer_put_jmp_near_label(writer, target_label);
+        return true;
+    };
+
+    return emit_restore(inside_restore, inside_label) &&
+           emit_restore(outside_restore, outside_label) &&
+           emit_restore(partial_restore, partial_label) &&
+           emit_restore(overflow_restore, overflow_label);
+}
 
 // ---------------------------------------------------------------------------
 // Internal context
@@ -36,6 +131,7 @@ struct pgas_stalker_ctx {
 
     pgas_stalker_config_t config;
     pgas_stalker_stats_t stats;
+    pgas_x86_runtime *runtime;
 
     bool active;
 };
@@ -43,19 +139,6 @@ struct pgas_stalker_ctx {
 // ---------------------------------------------------------------------------
 // Helpers: detect if a Capstone instruction has a memory operand
 // ---------------------------------------------------------------------------
-
-struct mov_mem_info {
-    bool has_mem_op;
-    bool is_load;
-    bool is_store;
-    uint8_t mem_op_idx;
-    uint8_t reg_op_idx;
-    uint8_t access_size;
-    x86_reg base_reg;
-    x86_reg index_reg;
-    int scale;
-    int64_t disp;
-};
 
 static bool is_mov_insn(unsigned int insn_id) {
     switch (insn_id) {
@@ -73,6 +156,88 @@ static bool is_mov_insn(unsigned int insn_id) {
     }
 }
 
+static bool mov_is_enabled(unsigned int insn_id,
+                           const pgas_stalker_config_t *cfg)
+{
+    if ((insn_id == X86_INS_MOV || insn_id == X86_INS_MOVABS) &&
+        !cfg->hook_mov)
+        return false;
+    if ((insn_id == X86_INS_MOVZX || insn_id == X86_INS_MOVSXD ||
+         insn_id == X86_INS_MOVSX) &&
+        !cfg->hook_movzx)
+        return false;
+    if ((insn_id == X86_INS_MOVNTI || insn_id == X86_INS_MOVNTDQ ||
+         insn_id == X86_INS_MOVNTPS || insn_id == X86_INS_MOVNTPD) &&
+        !cfg->hook_movnti)
+        return false;
+    return true;
+}
+
+static bool is_gpr(x86_reg reg)
+{
+    switch (reg) {
+    case X86_REG_RAX: case X86_REG_EAX: case X86_REG_AX: case X86_REG_AL:
+    case X86_REG_AH:
+    case X86_REG_RBX: case X86_REG_EBX: case X86_REG_BX: case X86_REG_BL:
+    case X86_REG_BH:
+    case X86_REG_RCX: case X86_REG_ECX: case X86_REG_CX: case X86_REG_CL:
+    case X86_REG_CH:
+    case X86_REG_RDX: case X86_REG_EDX: case X86_REG_DX: case X86_REG_DL:
+    case X86_REG_DH:
+    case X86_REG_RSI: case X86_REG_ESI: case X86_REG_SI: case X86_REG_SIL:
+    case X86_REG_RDI: case X86_REG_EDI: case X86_REG_DI: case X86_REG_DIL:
+    case X86_REG_RBP: case X86_REG_EBP: case X86_REG_BP: case X86_REG_BPL:
+    case X86_REG_RSP: case X86_REG_ESP: case X86_REG_SP: case X86_REG_SPL:
+    case X86_REG_R8: case X86_REG_R8D: case X86_REG_R8W: case X86_REG_R8B:
+    case X86_REG_R9: case X86_REG_R9D: case X86_REG_R9W: case X86_REG_R9B:
+    case X86_REG_R10: case X86_REG_R10D: case X86_REG_R10W: case X86_REG_R10B:
+    case X86_REG_R11: case X86_REG_R11D: case X86_REG_R11W: case X86_REG_R11B:
+    case X86_REG_R12: case X86_REG_R12D: case X86_REG_R12W: case X86_REG_R12B:
+    case X86_REG_R13: case X86_REG_R13D: case X86_REG_R13W: case X86_REG_R13B:
+    case X86_REG_R14: case X86_REG_R14D: case X86_REG_R14W: case X86_REG_R14B:
+    case X86_REG_R15: case X86_REG_R15D: case X86_REG_R15W: case X86_REG_R15B:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static pgas_x86_register_class register_class(x86_reg reg)
+{
+    if (is_gpr(reg))
+        return pgas_x86_register_class::gpr;
+    if (reg >= X86_REG_XMM0 && reg <= X86_REG_XMM31)
+        return pgas_x86_register_class::xmm;
+    if (reg >= X86_REG_YMM0 && reg <= X86_REG_YMM31)
+        return pgas_x86_register_class::ymm;
+    if (reg >= X86_REG_ZMM0 && reg <= X86_REG_ZMM31)
+        return pgas_x86_register_class::zmm;
+    return pgas_x86_register_class::none;
+}
+
+static bool is_atomic_instruction(const cs_insn *insn)
+{
+    const auto &x86 = insn->detail->x86;
+    if (x86.prefix[0] == X86_PREFIX_LOCK || x86.prefix[1] == X86_PREFIX_LOCK ||
+        x86.prefix[2] == X86_PREFIX_LOCK || x86.prefix[3] == X86_PREFIX_LOCK)
+        return true;
+    switch (insn->id) {
+    case X86_INS_XCHG:
+    case X86_INS_CMPXCHG:
+    case X86_INS_CMPXCHG8B:
+    case X86_INS_CMPXCHG16B:
+    case X86_INS_XADD:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool is_prefetch_instruction(const cs_insn *insn)
+{
+    return strncmp(insn->mnemonic, "prefetch", 8) == 0;
+}
+
 // OPT 1: Skip stack-relative memory accesses at JIT time.
 // RSP/RBP-based movs are local stack variables — never CXL addresses.
 static bool is_stack_relative(x86_reg reg) {
@@ -85,44 +250,76 @@ static bool is_stack_relative(x86_reg reg) {
     }
 }
 
-static bool analyze_mov(const cs_insn *insn, const pgas_stalker_config_t *cfg,
-                        mov_mem_info *out) {
-    memset(out, 0, sizeof(*out));
-    if (!is_mov_insn(insn->id)) return false;
-
-    if (!cfg->hook_mov &&
-        (insn->id == X86_INS_MOV || insn->id == X86_INS_MOVABS))
-        return false;
-    if (!cfg->hook_movzx &&
-        (insn->id == X86_INS_MOVZX || insn->id == X86_INS_MOVSXD ||
-         insn->id == X86_INS_MOVSX))
-        return false;
-    if (!cfg->hook_movnti &&
-        (insn->id == X86_INS_MOVNTI || insn->id == X86_INS_MOVNTDQ ||
-         insn->id == X86_INS_MOVNTPS || insn->id == X86_INS_MOVNTPD))
+static bool analyze_memory_instruction(
+    const cs_insn *insn, const pgas_stalker_config_t *cfg,
+    pgas_x86_memory_descriptor *out)
+{
+    *out = {};
+    if (insn == nullptr || insn->detail == nullptr)
         return false;
 
+    out->instruction_address = insn->address;
+    out->instruction_id = insn->id;
+    snprintf(out->mnemonic, sizeof(out->mnemonic), "%s", insn->mnemonic);
+    out->atomic = is_atomic_instruction(insn);
     const cs_x86 *x86 = &insn->detail->x86;
+    uint8_t memory_count = 0;
     for (uint8_t i = 0; i < x86->op_count; i++) {
         if (x86->operands[i].type == X86_OP_MEM) {
-            out->has_mem_op = true;
-            out->mem_op_idx = i;
-            out->base_reg = x86->operands[i].mem.base;
-            out->index_reg = x86->operands[i].mem.index;
+            ++memory_count;
+            if (memory_count != 1)
+                continue;
+            out->memory_operand_index = i;
+            out->base_register = x86->operands[i].mem.base;
+            out->index_register = x86->operands[i].mem.index;
             out->scale = x86->operands[i].mem.scale;
-            out->disp = x86->operands[i].mem.disp;
-            out->access_size = x86->operands[i].size;
-            if (i == 0) {
-                out->is_store = true;
-                out->reg_op_idx = 1;
+            out->displacement = x86->operands[i].mem.disp;
+            out->width = x86->operands[i].size;
+
+            const auto access = x86->operands[i].access;
+            if (is_prefetch_instruction(insn)) {
+                out->access_class = pgas_x86_access_class::prefetch;
+            } else if ((access & CS_AC_READ) && (access & CS_AC_WRITE)) {
+                out->access_class = pgas_x86_access_class::read_modify_write;
+            } else if (access & CS_AC_READ) {
+                out->access_class = pgas_x86_access_class::read;
+            } else if (access & CS_AC_WRITE) {
+                out->access_class = pgas_x86_access_class::write;
+            } else if (i != 0) {
+                out->access_class = pgas_x86_access_class::read;
+            } else if (is_mov_insn(insn->id)) {
+                out->access_class = pgas_x86_access_class::write;
             } else {
-                out->is_load = true;
-                out->reg_op_idx = 0;
+                out->access_class = pgas_x86_access_class::read_modify_write;
             }
+        }
+    }
+    if (memory_count == 0)
+        return false;
+    if (memory_count != 1)
+        out->access_class = pgas_x86_access_class::unsupported;
+
+    for (uint8_t i = 0; i < x86->op_count; ++i) {
+        if (i == out->memory_operand_index)
+            continue;
+        if (x86->operands[i].type == X86_OP_REG) {
+            out->data_register = x86->operands[i].reg;
+            out->register_class =
+                register_class(static_cast<x86_reg>(out->data_register));
             break;
         }
     }
-    return out->has_mem_op;
+
+    const bool scalar_width = out->width == 1 || out->width == 2 ||
+                              out->width == 4 || out->width == 8;
+    const bool simple_access =
+        out->access_class == pgas_x86_access_class::read ||
+        out->access_class == pgas_x86_access_class::write;
+    out->executable_scalar_mov =
+        memory_count == 1 && is_mov_insn(insn->id) &&
+        mov_is_enabled(insn->id, cfg) && simple_access && scalar_width &&
+        out->register_class == pgas_x86_register_class::gpr && !out->atomic;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -153,88 +350,77 @@ static uint64_t read_reg(const GumCpuContext *cpu, x86_reg reg) {
     }
 }
 
-static void write_reg(GumCpuContext *cpu, x86_reg reg, uint64_t val) {
-    switch (reg) {
-    case X86_REG_RAX: case X86_REG_EAX: case X86_REG_AX: case X86_REG_AL: cpu->rax = val; break;
-    case X86_REG_RBX: case X86_REG_EBX: case X86_REG_BX: case X86_REG_BL: cpu->rbx = val; break;
-    case X86_REG_RCX: case X86_REG_ECX: case X86_REG_CX: case X86_REG_CL: cpu->rcx = val; break;
-    case X86_REG_RDX: case X86_REG_EDX: case X86_REG_DX: case X86_REG_DL: cpu->rdx = val; break;
-    case X86_REG_RSI: case X86_REG_ESI: case X86_REG_SI: case X86_REG_SIL: cpu->rsi = val; break;
-    case X86_REG_RDI: case X86_REG_EDI: case X86_REG_DI: case X86_REG_DIL: cpu->rdi = val; break;
-    case X86_REG_RBP: case X86_REG_EBP: case X86_REG_BP: case X86_REG_BPL: cpu->rbp = val; break;
-    case X86_REG_RSP: case X86_REG_ESP: case X86_REG_SP: case X86_REG_SPL: cpu->rsp = val; break;
-    case X86_REG_R8:  case X86_REG_R8D:  case X86_REG_R8W:  case X86_REG_R8B:  cpu->r8  = val; break;
-    case X86_REG_R9:  case X86_REG_R9D:  case X86_REG_R9W:  case X86_REG_R9B:  cpu->r9  = val; break;
-    case X86_REG_R10: case X86_REG_R10D: case X86_REG_R10W: case X86_REG_R10B: cpu->r10 = val; break;
-    case X86_REG_R11: case X86_REG_R11D: case X86_REG_R11W: case X86_REG_R11B: cpu->r11 = val; break;
-    case X86_REG_R12: case X86_REG_R12D: case X86_REG_R12W: case X86_REG_R12B: cpu->r12 = val; break;
-    case X86_REG_R13: case X86_REG_R13D: case X86_REG_R13W: case X86_REG_R13B: cpu->r13 = val; break;
-    case X86_REG_R14: case X86_REG_R14D: case X86_REG_R14W: case X86_REG_R14B: cpu->r14 = val; break;
-    case X86_REG_R15: case X86_REG_R15D: case X86_REG_R15W: case X86_REG_R15B: cpu->r15 = val; break;
-    default: break;
-    }
-}
-
 // Map Capstone register to Frida GumX86Reg for inline codegen
 static GumX86Reg cs_to_gum_reg(x86_reg reg) {
     switch (reg) {
-    case X86_REG_RAX: case X86_REG_EAX: return GUM_X86_RAX;
-    case X86_REG_RBX: case X86_REG_EBX: return GUM_X86_RBX;
-    case X86_REG_RCX: case X86_REG_ECX: return GUM_X86_RCX;
-    case X86_REG_RDX: case X86_REG_EDX: return GUM_X86_RDX;
-    case X86_REG_RSI: case X86_REG_ESI: return GUM_X86_RSI;
-    case X86_REG_RDI: case X86_REG_EDI: return GUM_X86_RDI;
-    case X86_REG_RBP: case X86_REG_EBP: return GUM_X86_RBP;
-    case X86_REG_RSP: case X86_REG_ESP: return GUM_X86_RSP;
-    case X86_REG_R8:  case X86_REG_R8D:  return GUM_X86_R8;
-    case X86_REG_R9:  case X86_REG_R9D:  return GUM_X86_R9;
-    case X86_REG_R10: case X86_REG_R10D: return GUM_X86_R10;
-    case X86_REG_R11: case X86_REG_R11D: return GUM_X86_R11;
-    case X86_REG_R12: case X86_REG_R12D: return GUM_X86_R12;
-    case X86_REG_R13: case X86_REG_R13D: return GUM_X86_R13;
-    case X86_REG_R14: case X86_REG_R14D: return GUM_X86_R14;
-    case X86_REG_R15: case X86_REG_R15D: return GUM_X86_R15;
-    default: return GUM_X86_RAX;
+    case X86_REG_RAX: case X86_REG_EAX: case X86_REG_AX:
+    case X86_REG_AL: case X86_REG_AH: return GUM_X86_RAX;
+    case X86_REG_RBX: case X86_REG_EBX: case X86_REG_BX:
+    case X86_REG_BL: case X86_REG_BH: return GUM_X86_RBX;
+    case X86_REG_RCX: case X86_REG_ECX: case X86_REG_CX:
+    case X86_REG_CL: case X86_REG_CH: return GUM_X86_RCX;
+    case X86_REG_RDX: case X86_REG_EDX: case X86_REG_DX:
+    case X86_REG_DL: case X86_REG_DH: return GUM_X86_RDX;
+    case X86_REG_RSI: case X86_REG_ESI: case X86_REG_SI:
+    case X86_REG_SIL: return GUM_X86_RSI;
+    case X86_REG_RDI: case X86_REG_EDI: case X86_REG_DI:
+    case X86_REG_DIL: return GUM_X86_RDI;
+    case X86_REG_RBP: case X86_REG_EBP: case X86_REG_BP:
+    case X86_REG_BPL: return GUM_X86_RBP;
+    case X86_REG_RSP: case X86_REG_ESP: case X86_REG_SP:
+    case X86_REG_SPL: return GUM_X86_RSP;
+    case X86_REG_R8: case X86_REG_R8D: case X86_REG_R8W:
+    case X86_REG_R8B: return GUM_X86_R8;
+    case X86_REG_R9: case X86_REG_R9D: case X86_REG_R9W:
+    case X86_REG_R9B: return GUM_X86_R9;
+    case X86_REG_R10: case X86_REG_R10D: case X86_REG_R10W:
+    case X86_REG_R10B: return GUM_X86_R10;
+    case X86_REG_R11: case X86_REG_R11D: case X86_REG_R11W:
+    case X86_REG_R11B: return GUM_X86_R11;
+    case X86_REG_R12: case X86_REG_R12D: case X86_REG_R12W:
+    case X86_REG_R12B: return GUM_X86_R12;
+    case X86_REG_R13: case X86_REG_R13D: case X86_REG_R13W:
+    case X86_REG_R13B: return GUM_X86_R13;
+    case X86_REG_R14: case X86_REG_R14D: case X86_REG_R14W:
+    case X86_REG_R14B: return GUM_X86_R14;
+    case X86_REG_R15: case X86_REG_R15D: case X86_REG_R15W:
+    case X86_REG_R15B: return GUM_X86_R15;
+    default: return GUM_X86_NONE;
     }
 }
 #endif // __x86_64__
 
-static uint64_t compute_ea(const GumCpuContext *cpu, const mov_mem_info *info) {
-    uint64_t ea = (uint64_t)info->disp;
-    if (info->base_reg != X86_REG_INVALID)
-        ea += read_reg(cpu, info->base_reg);
-    if (info->index_reg != X86_REG_INVALID)
-        ea += read_reg(cpu, info->index_reg) * info->scale;
+static uint64_t compute_ea(const GumCpuContext *cpu,
+                           const pgas_x86_memory_descriptor *descriptor) {
+    uint64_t ea = static_cast<uint64_t>(descriptor->displacement);
+    if (descriptor->base_register != X86_REG_INVALID)
+        ea += read_reg(cpu, static_cast<x86_reg>(descriptor->base_register));
+    if (descriptor->index_register != X86_REG_INVALID)
+        ea += read_reg(cpu, static_cast<x86_reg>(descriptor->index_register)) *
+              descriptor->scale;
     return ea;
-}
-
-static bool is_in_pgas_range(uint64_t ea, uint64_t base, uint64_t size) {
-    return size != 0 && ea >= base && (ea - base) < size;
 }
 
 // ---------------------------------------------------------------------------
 // OPT 4: Lock-free bump allocator for callout metadata
 // ---------------------------------------------------------------------------
 
-struct mov_callout_data {
-    // OPT 5: Inline the range check constants to avoid pointer chasing
+struct memory_callout_data {
     uint64_t pgas_base;
     uint64_t pgas_size;
     uint16_t local_node_id;
-    uint16_t num_nodes;
-    pgas_stalker_stats_t *stats;  // direct pointer, no ctx indirection
-
-    mov_mem_info info;
-    x86_reg dest_reg;
-    x86_reg src_reg;
+    pgas_stalker_stats_t *stats;
+    pgas_x86_runtime *runtime;
+    pgas_x86_memory_descriptor descriptor;
+    char labels[5];
 };
 
 // Bump allocator: single contiguous block, no locks, no free
 #define CALLOUT_POOL_CAPACITY (1024 * 1024)
-static mov_callout_data g_callout_pool_storage[CALLOUT_POOL_CAPACITY];
+static memory_callout_data g_callout_pool_storage[CALLOUT_POOL_CAPACITY];
 static uint64_t g_callout_pool_next = 0;
 
-static mov_callout_data *alloc_callout_data() {
+static memory_callout_data *alloc_callout_data() {
     uint64_t idx = __atomic_fetch_add(&g_callout_pool_next, 1, __ATOMIC_RELAXED);
     if (idx >= CALLOUT_POOL_CAPACITY) {
         SPDLOG_ERROR("Callout pool exhausted ({} entries)", CALLOUT_POOL_CAPACITY);
@@ -243,164 +429,187 @@ static mov_callout_data *alloc_callout_data() {
     return &g_callout_pool_storage[idx];
 }
 
-// ---------------------------------------------------------------------------
-// Callout: runs at each instrumented mov at runtime (SLOW PATH only)
-//
-// OPT 2: The inline range check in the JIT'd code already filtered out
-// non-CXL addresses. This callout only fires for addresses IN the CXL range.
-// ---------------------------------------------------------------------------
+struct pending_access {
+    pgas_x86_access_event event{};
+    bool active{};
+};
 
-static void mov_load_callout(GumCpuContext *cpu_context, gpointer user_data) {
-    auto *cd = (mov_callout_data *)user_data;
+static thread_local pending_access current_access;
 
-    uint64_t ea = compute_ea(cpu_context, &cd->info);
-    if (!is_in_pgas_range(ea, cd->pgas_base, cd->pgas_size) ||
-        cd->num_nodes == 0) {
-        return;
-    }
-
-    // Route to node
-    uint64_t offset = ea - cd->pgas_base;
-    uint64_t region_per_node = cd->pgas_size / cd->num_nodes;
-    if (region_per_node == 0) return;
-    uint16_t node = (uint16_t)(offset / region_per_node);
-    if (node >= cd->num_nodes) node = cd->num_nodes - 1;
-
-    if (node == cd->local_node_id) {
-        __atomic_fetch_add(&cd->stats->local_passthrough, 1, __ATOMIC_RELAXED);
-        return; // Local - original mov hits shadow/DAX directly
-    }
-
-    // Remote load
-    uint64_t val = 0;
-    size_t sz = cd->info.access_size;
-    if (sz > 8) sz = 8;
-
-    auto &hooker = pgas_cxlmemsim_hooker::instance();
-    hooker.remote_read(node, ea, &val, sz);
-    write_reg(cpu_context, cd->dest_reg, val);
-
-    __atomic_fetch_add(&cd->stats->remote_loads, 1, __ATOMIC_RELAXED);
+[[noreturn]] static void strict_access_failure(
+    const memory_callout_data *cd, uint64_t effective_address, int error)
+{
+    const auto &descriptor = cd->descriptor;
+    dprintf(STDERR_FILENO,
+            "Splash x86 PGAS validation failure: pc=0x%lx insn=%s(%u) "
+            "ea=0x%lx width=%u class=%u error=%d\n",
+            descriptor.instruction_address, descriptor.mnemonic,
+            descriptor.instruction_id, effective_address, descriptor.width,
+            static_cast<unsigned>(descriptor.access_class), error);
+    _exit(125);
 }
 
-static void mov_store_callout(GumCpuContext *cpu_context, gpointer user_data) {
-    auto *cd = (mov_callout_data *)user_data;
-
-    uint64_t ea = compute_ea(cpu_context, &cd->info);
-    if (!is_in_pgas_range(ea, cd->pgas_base, cd->pgas_size) ||
-        cd->num_nodes == 0) {
-        return;
-    }
-
-    uint64_t offset = ea - cd->pgas_base;
-    uint64_t region_per_node = cd->pgas_size / cd->num_nodes;
-    if (region_per_node == 0) return;
-    uint16_t node = (uint16_t)(offset / region_per_node);
-    if (node >= cd->num_nodes) node = cd->num_nodes - 1;
-
-    if (node == cd->local_node_id) {
-        __atomic_fetch_add(&cd->stats->local_passthrough, 1, __ATOMIC_RELAXED);
-        return;
-    }
-
-    uint64_t val = read_reg(cpu_context, cd->src_reg);
-    size_t sz = cd->info.access_size;
-    if (sz > 8) sz = 8;
-
-    auto &hooker = pgas_cxlmemsim_hooker::instance();
-    hooker.remote_write(node, ea, &val, sz);
-
-    __atomic_fetch_add(&cd->stats->remote_stores, 1, __ATOMIC_RELAXED);
+static void runtime_failure(void *, const pgas_x86_failure &failure)
+{
+    dprintf(STDERR_FILENO,
+            "Splash x86 PGAS transport failure: pc=0x%lx insn=%u "
+            "ea=0x%lx width=%zu class=%u segment=%u node=%u error=%d\n",
+            failure.instruction_address, failure.instruction_id,
+            failure.effective_address, failure.width,
+            static_cast<unsigned>(failure.access_class),
+            failure.segment_index, failure.target_node,
+            failure.transport_error);
+    _exit(125);
 }
 
-// ---------------------------------------------------------------------------
-// OPT 2: Emit inline range check using GumX86Writer
-//
-// Instead of calling out on EVERY mov-with-memory-operand, emit ~8
-// instructions of inline asm that check if the EA is in [base, base+size).
-// Only if it IS in range, the (expensive) callout fires.
-//
-// For lat_mem_rd with pointer chasing in the CXL range, this doesn't
-// help (every access is in-range). But for mixed workloads it eliminates
-// ~95% of callout overhead.
-//
-//   pushfq
-//   push rcx                    ; scratch register
-//   lea  rcx, [<EA expression>] ; or: mov rcx, <base_reg>
-//   sub  rcx, PGAS_BASE
-//   cmp  rcx, PGAS_SIZE         ; unsigned: rcx-BASE < SIZE
-//   pop  rcx
-//   popfq
-//   jae  skip_callout           ; not in CXL range (common case)
-//   <callout>                   ; CXL range hit (rare/hot path)
-//   skip_callout:
-//   <original instruction>
-// ---------------------------------------------------------------------------
+static uint64_t read_data_register(const GumCpuContext *cpu, x86_reg reg)
+{
+    uint64_t value = read_reg(cpu, reg);
+    if (reg == X86_REG_AH || reg == X86_REG_BH || reg == X86_REG_CH ||
+        reg == X86_REG_DH)
+        value >>= 8;
+    return value;
+}
 
-static void emit_inline_range_check(GumStalkerIterator *iterator,
-                                    GumStalkerOutput *output,
-                                    const mov_mem_info *info,
-                                    mov_callout_data *cd,
-                                    bool is_load) {
-    GumX86Writer *cw = output->writer.x86;
+static void memory_pre_callout(GumCpuContext *cpu_context, gpointer user_data)
+{
+    auto *cd = static_cast<memory_callout_data *>(user_data);
+    const auto effective_address = compute_ea(cpu_context, &cd->descriptor);
+    const auto range = pgas_x86_classify_range(
+        effective_address, cd->descriptor.width, cd->pgas_base,
+        cd->pgas_size);
+    if (range == pgas_x86_range_result::outside)
+        return;
+    if (range == pgas_x86_range_result::partial)
+        strict_access_failure(cd, effective_address, -ERANGE);
+    if (range == pgas_x86_range_result::overflow)
+        strict_access_failure(cd, effective_address, -EOVERFLOW);
+    if (!cd->descriptor.executable_scalar_mov ||
+        cd->descriptor.access_class == pgas_x86_access_class::prefetch)
+        strict_access_failure(cd, effective_address, -ENOTSUP);
+    if (current_access.active)
+        strict_access_failure(cd, effective_address, -EBUSY);
 
-    // Choose a scratch register that is NOT the base/index/dest/src register
-    // to avoid clobbering. RCX is usually safe (caller-saved).
-    GumX86Reg scratch = GUM_X86_XCX;
-    if (info->base_reg != X86_REG_INVALID) {
-        GumX86Reg base_gum = cs_to_gum_reg(info->base_reg);
-        if (base_gum == scratch) scratch = GUM_X86_XDX;
+    current_access.event = {};
+    current_access.event.descriptor = &cd->descriptor;
+    current_access.event.effective_address = effective_address;
+
+    int result{};
+    if (cd->descriptor.access_class == pgas_x86_access_class::read) {
+        result = pgas_x86_begin_load(cd->runtime, &current_access.event);
+    } else if (cd->descriptor.access_class == pgas_x86_access_class::write) {
+        const uint64_t value = read_data_register(
+            cpu_context, static_cast<x86_reg>(cd->descriptor.data_register));
+        result = pgas_x86_begin_store(cd->runtime, &current_access.event,
+                                      &value, cd->descriptor.width);
+    } else {
+        strict_access_failure(cd, effective_address, -ENOTSUP);
     }
+    if (result != 0)
+        strict_access_failure(cd, effective_address, result);
 
-    // For simple [base_reg] or [base_reg + disp] (no index), we can do
-    // a fast inline check. For complex addressing modes, fall through
-    // to the callout unconditionally.
-    bool can_inline = (info->base_reg != X86_REG_INVALID &&
-                       info->index_reg == X86_REG_INVALID);
+    current_access.active = true;
+    __atomic_fetch_add(&cd->stats->callouts_fired, 1, __ATOMIC_RELAXED);
+    if (current_access.event.target_node == cd->local_node_id) {
+        __atomic_fetch_add(&cd->stats->local_passthrough, 1,
+                           __ATOMIC_RELAXED);
+    } else if (cd->descriptor.access_class == pgas_x86_access_class::read) {
+        __atomic_fetch_add(&cd->stats->remote_loads, 1, __ATOMIC_RELAXED);
+    } else {
+        __atomic_fetch_add(&cd->stats->remote_stores, 1, __ATOMIC_RELAXED);
+    }
+}
 
-    if (!can_inline || cd->pgas_size > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
-        // Complex addressing or large PGAS regions use the checked callout.
-        gum_stalker_iterator_put_callout(iterator,
-            is_load ? mov_load_callout : mov_store_callout, cd, NULL);
+static void memory_post_callout(GumCpuContext *, gpointer)
+{
+    if (!current_access.active)
+        return;
+    pgas_x86_finish_access(&current_access.event);
+    current_access.active = false;
+}
+
+static bool choose_scratch_registers(
+    const pgas_x86_memory_descriptor &descriptor,
+    std::array<GumX86Reg, 3> &scratch)
+{
+    constexpr std::array candidates{
+        GUM_X86_RAX, GUM_X86_RCX, GUM_X86_RDX, GUM_X86_RSI,
+        GUM_X86_RDI, GUM_X86_R8,  GUM_X86_R9,  GUM_X86_R10,
+        GUM_X86_R11, GUM_X86_R12, GUM_X86_R13, GUM_X86_R14,
+        GUM_X86_R15,
+    };
+    const GumX86Reg base =
+        cs_to_gum_reg(static_cast<x86_reg>(descriptor.base_register));
+    const GumX86Reg index =
+        cs_to_gum_reg(static_cast<x86_reg>(descriptor.index_register));
+    const GumX86Reg data =
+        cs_to_gum_reg(static_cast<x86_reg>(descriptor.data_register));
+    size_t count{};
+    for (const auto candidate : candidates) {
+        if (candidate == base || candidate == index || candidate == data)
+            continue;
+        scratch[count++] = candidate;
+        if (count == scratch.size())
+            return true;
+    }
+    return false;
+}
+
+static void emit_memory_access(GumStalkerIterator *iterator,
+                               GumStalkerOutput *output,
+                               memory_callout_data *cd)
+{
+    auto *writer = output->writer.x86;
+    const auto &descriptor = cd->descriptor;
+    const bool simple_address =
+        descriptor.base_register != X86_REG_INVALID &&
+        descriptor.base_register != X86_REG_RIP &&
+        descriptor.index_register == X86_REG_INVALID;
+    std::array<GumX86Reg, 3> scratch{};
+    const bool can_inline = simple_address &&
+                            choose_scratch_registers(descriptor, scratch);
+
+    if (!can_inline) {
+        gum_stalker_iterator_put_callout(iterator, memory_pre_callout, cd,
+                                         nullptr);
+        gum_stalker_iterator_keep(iterator);
+        gum_stalker_iterator_put_callout(iterator, memory_post_callout, cd,
+                                         nullptr);
         return;
     }
 
-    GumX86Reg base_gum = cs_to_gum_reg(info->base_reg);
-
-    // Emit: pushfq; push scratch
-    gum_x86_writer_put_pushfx(cw);
-    gum_x86_writer_put_push_reg(cw, scratch);
-
-    // Emit: mov scratch, base_reg (copy EA base)
-    gum_x86_writer_put_mov_reg_reg(cw, scratch, base_gum);
-
-    // If there's a displacement, add it
-    if (info->disp != 0) {
-        gum_x86_writer_put_add_reg_imm(cw, scratch, (gssize)info->disp);
+    const auto inside = static_cast<gconstpointer>(&cd->labels[0]);
+    const auto outside = static_cast<gconstpointer>(&cd->labels[1]);
+    const auto partial = static_cast<gconstpointer>(&cd->labels[2]);
+    const auto overflow = static_cast<gconstpointer>(&cd->labels[3]);
+    const auto original = static_cast<gconstpointer>(&cd->labels[4]);
+    if (!pgas_x86_emit_range_gate(
+            writer,
+            cs_to_gum_reg(static_cast<x86_reg>(descriptor.base_register)),
+            scratch[0], scratch[1], scratch[2], descriptor.displacement,
+            descriptor.width, cd->pgas_base, cd->pgas_size, inside, outside,
+            partial, overflow)) {
+        strict_access_failure(cd, descriptor.instruction_address, -EINVAL);
     }
 
-    // Emit: sub scratch, PGAS_BASE (unsigned range check trick)
-    gum_x86_writer_put_sub_reg_imm(cw, scratch, (gssize)cd->pgas_base);
+    gum_x86_writer_put_label(writer, inside);
+    gum_stalker_iterator_put_callout(iterator, memory_pre_callout, cd, nullptr);
+    gum_x86_writer_put_jmp_near_label(writer, original);
 
-    // Emit: cmp scratch, PGAS_SIZE
-    // If (addr - BASE) >= SIZE, addr is outside the range
-    gum_x86_writer_put_cmp_reg_i32(cw, scratch, (int32_t)cd->pgas_size);
+    gum_x86_writer_put_label(writer, outside);
+    gum_x86_writer_put_jmp_near_label(writer, original);
 
-    // Emit: pop scratch; popfq (restore BEFORE the branch)
-    gum_x86_writer_put_pop_reg(cw, scratch);
-    gum_x86_writer_put_popfx(cw);
+    gum_x86_writer_put_label(writer, partial);
+    gum_stalker_iterator_put_callout(iterator, memory_pre_callout, cd, nullptr);
+    gum_x86_writer_put_breakpoint(writer);
 
-    // Emit: jae skip_label (jump if outside CXL range — fast path)
-    gconstpointer skip_label = GSIZE_TO_POINTER(
-        (gsize)cd + 1); // unique label ID per callout_data
-    gum_x86_writer_put_jcc_near_label(cw, X86_INS_JAE, skip_label, GUM_NO_HINT);
+    gum_x86_writer_put_label(writer, overflow);
+    gum_stalker_iterator_put_callout(iterator, memory_pre_callout, cd, nullptr);
+    gum_x86_writer_put_breakpoint(writer);
 
-    // === SLOW PATH: address is in CXL range, do the callout ===
-    gum_stalker_iterator_put_callout(iterator,
-        is_load ? mov_load_callout : mov_store_callout, cd, NULL);
-
-    // === FAST PATH: skip label ===
-    gum_x86_writer_put_label(cw, skip_label);
+    gum_x86_writer_put_label(writer, original);
+    gum_stalker_iterator_keep(iterator);
+    gum_stalker_iterator_put_callout(iterator, memory_post_callout, cd, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -417,33 +626,37 @@ static void transform_block(GumStalkerIterator *iterator,
     while (gum_stalker_iterator_next(iterator, &insn)) {
         __atomic_fetch_add(&ctx->stats.insns_scanned, 1, __ATOMIC_RELAXED);
 
-        mov_mem_info info;
-        if (!analyze_mov(insn, &ctx->config, &info)) {
+        pgas_x86_memory_descriptor descriptor;
+        if (!analyze_memory_instruction(insn, &ctx->config, &descriptor)) {
             gum_stalker_iterator_keep(iterator);
             continue;
         }
 
         // OPT 1: Skip stack-relative accesses (RSP/RBP-based).
         // These are local variables, function args, spills — never CXL.
-        if (is_stack_relative(info.base_reg)) {
+        if (is_stack_relative(
+                static_cast<x86_reg>(descriptor.base_register))) {
             gum_stalker_iterator_keep(iterator);
             continue;
         }
 
         // Static displacement-only: check at JIT time
-        bool needs_runtime = (info.base_reg != X86_REG_INVALID ||
-                              info.index_reg != X86_REG_INVALID);
+        const bool needs_runtime =
+            descriptor.base_register != X86_REG_INVALID ||
+            descriptor.index_register != X86_REG_INVALID;
         if (!needs_runtime) {
-            uint64_t ea = (uint64_t)info.disp;
-            if (ea < ctx->config.pgas_base_addr ||
-                ea >= ctx->config.pgas_base_addr + ctx->config.pgas_region_size) {
+            const auto range = pgas_x86_classify_range(
+                static_cast<uint64_t>(descriptor.displacement),
+                descriptor.width, ctx->config.pgas_base_addr,
+                ctx->config.pgas_region_size);
+            if (range == pgas_x86_range_result::outside) {
                 gum_stalker_iterator_keep(iterator);
                 continue;
             }
         }
 
         // RIP-relative addressing: typically code/data segment, not CXL
-        if (info.base_reg == X86_REG_RIP) {
+        if (descriptor.base_register == X86_REG_RIP) {
             gum_stalker_iterator_keep(iterator);
             continue;
         }
@@ -459,32 +672,15 @@ static void transform_block(GumStalkerIterator *iterator,
         cd->pgas_base = ctx->config.pgas_base_addr;
         cd->pgas_size = ctx->config.pgas_region_size;
         cd->local_node_id = ctx->config.local_node_id;
-        cd->num_nodes = ctx->config.num_nodes;
         cd->stats = &ctx->stats;
-        cd->info = info;
+        cd->runtime = ctx->runtime;
+        cd->descriptor = descriptor;
 
-        const cs_x86 *x86 = &insn->detail->x86;
-
-        if (info.is_load) {
-            cd->dest_reg = (x86_reg)x86->operands[info.reg_op_idx].reg;
-            cd->src_reg = X86_REG_INVALID;
-
-            // OPT 2: Inline range check, callout only for CXL addresses
-            emit_inline_range_check(iterator, output, &info, cd, true);
-            gum_stalker_iterator_keep(iterator);
-
+        emit_memory_access(iterator, output, cd);
+        if (descriptor.access_class == pgas_x86_access_class::read) {
             __atomic_fetch_add(&ctx->stats.mov_loads_hooked, 1, __ATOMIC_RELAXED);
-
-        } else if (info.is_store) {
-            cd->src_reg = (x86_reg)x86->operands[info.reg_op_idx].reg;
-            cd->dest_reg = X86_REG_INVALID;
-
-            emit_inline_range_check(iterator, output, &info, cd, false);
-            gum_stalker_iterator_keep(iterator);
-
+        } else if (descriptor.access_class == pgas_x86_access_class::write) {
             __atomic_fetch_add(&ctx->stats.mov_stores_hooked, 1, __ATOMIC_RELAXED);
-        } else {
-            gum_stalker_iterator_keep(iterator);
         }
     }
 }
@@ -496,9 +692,12 @@ static void transform_block(GumStalkerIterator *iterator,
 extern "C" {
 
 pgas_stalker_ctx_t *pgas_stalker_init(const pgas_stalker_config_t *config) {
+    if (config == nullptr)
+        return nullptr;
     auto *ctx = new pgas_stalker_ctx();
     memset(&ctx->stats, 0, sizeof(ctx->stats));
     ctx->config = *config;
+    ctx->runtime = nullptr;
     ctx->active = false;
 
     if (!config->hook_mov && !config->hook_movzx &&
@@ -508,9 +707,26 @@ pgas_stalker_ctx_t *pgas_stalker_init(const pgas_stalker_config_t *config) {
         ctx->config.hook_movnti = true;
     }
 
+    const pgas_x86_runtime_config runtime_config{
+        config->pgas_base_addr,
+        config->pgas_region_size,
+        config->local_node_id,
+        config->num_nodes,
+        pgas_cxlmemsim_x86_transport(),
+        runtime_failure,
+        nullptr,
+    };
+    ctx->runtime = pgas_x86_runtime_create(runtime_config);
+    if (ctx->runtime == nullptr) {
+        SPDLOG_ERROR("Invalid x86 PGAS runtime configuration");
+        delete ctx;
+        return nullptr;
+    }
+
     ctx->stalker = gum_stalker_new();
     if (!ctx->stalker) {
         SPDLOG_ERROR("gum_stalker_new() failed");
+        pgas_x86_runtime_destroy(ctx->runtime);
         delete ctx;
         return nullptr;
     }
@@ -613,6 +829,8 @@ void pgas_stalker_finalize(pgas_stalker_ctx_t *ctx) {
     }
     if (ctx->transformer)
         g_object_unref(ctx->transformer);
+
+    pgas_x86_runtime_destroy(ctx->runtime);
 
     // Reset bump allocator (no individual frees needed)
     g_callout_pool_next = 0;

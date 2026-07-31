@@ -87,6 +87,22 @@ void pgas_stalker_finalize(pgas_stalker_ctx_t *ctx);
 
 #ifdef __cplusplus
 }
+
+namespace bpftime::attach {
+
+bool pgas_x86_emit_range_gate(GumX86Writer *writer,
+                              GumX86Reg address_register,
+                              GumX86Reg scratch_start,
+                              GumX86Reg scratch_end,
+                              GumX86Reg scratch_bound, int64_t displacement,
+                              uint8_t width,
+                              uint64_t pgas_base, uint64_t pgas_size,
+                              gconstpointer inside_label,
+                              gconstpointer outside_label,
+                              gconstpointer partial_label,
+                              gconstpointer overflow_label);
+
+} // namespace bpftime::attach
 #endif
 
 #endif // _PGAS_STALKER_MOV_HPP
