@@ -14,6 +14,7 @@
 #define _PGAS_STALKER_MOV_HPP
 
 #include <frida-gum.h>
+#include <cstddef>
 #include <cstdint>
 #include <atomic>
 #include <mutex>
@@ -37,6 +38,8 @@ typedef struct {
     bool     hook_movnti;          // Hook non-temporal stores (default: true)
     bool     hook_rep_movs;        // Hook rep movsb/movsq (default: true)
     bool     verbose;              // Print instrumented instructions
+    const char *include_modules;   // Exact ELF basenames, comma-separated
+    bool     strict_validation;    // Fail validation on incomplete coverage
 } pgas_stalker_config_t;
 
 // Statistics
@@ -50,6 +53,20 @@ typedef struct {
     uint64_t remote_stores;        // Actual remote stores executed
     uint64_t local_passthrough;    // Local accesses (no-op callout)
 } pgas_stalker_stats_t;
+
+typedef struct {
+    uint64_t runtime_id;
+    uint64_t os_tid;
+    uint64_t remote_loads;
+    uint64_t remote_stores;
+    uint64_t bytes_read;
+    uint64_t bytes_written;
+    uint64_t cross_line_splits;
+    uint64_t unsupported;
+    uint64_t failures;
+    uint64_t follow_events;
+    uint64_t unfollow_events;
+} pgas_stalker_thread_stats_t;
 
 // Initialize stalker context (call after gum_init_embedded())
 pgas_stalker_ctx_t *pgas_stalker_init(const pgas_stalker_config_t *config);
@@ -78,6 +95,19 @@ void pgas_stalker_exclude(pgas_stalker_ctx_t *ctx, uint64_t base, uint64_t size)
 
 // Get statistics
 void pgas_stalker_get_stats(pgas_stalker_ctx_t *ctx, pgas_stalker_stats_t *stats);
+
+// Return the total record count and copy up to capacity records when output is
+// non-null. Runtime IDs are stable for the context lifetime.
+size_t pgas_stalker_snapshot_threads(pgas_stalker_ctx_t *ctx,
+                                     pgas_stalker_thread_stats_t *output,
+                                     size_t capacity);
+
+// Apply the same exact-basename policy used by translated code to a creator.
+int pgas_stalker_should_follow_creator(pgas_stalker_ctx_t *ctx,
+                                       const char *module_path);
+
+// Return nonzero when strict coverage and per-thread invariants are valid.
+int pgas_stalker_strict_valid(pgas_stalker_ctx_t *ctx);
 
 // Print statistics
 void pgas_stalker_print_stats(pgas_stalker_ctx_t *ctx);

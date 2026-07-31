@@ -10,10 +10,16 @@ namespace bpftime::attach {
 
 namespace {
 
-constexpr std::array<std::string_view, 3> hard_denied_modules{
+constexpr std::array<std::string_view, 9> hard_denied_modules{
     "libfrida-gum.so",
     "libpgas_preload.so",
     "libcxlmemsim_client.so",
+    "libc.so.6",
+    "libpthread.so.0",
+    "libdl.so.2",
+    "librt.so.1",
+    "ld-linux-x86-64.so.2",
+    "ld-linux-aarch64.so.1",
 };
 
 std::string_view trim(std::string_view value)
@@ -29,8 +35,13 @@ std::string_view trim(std::string_view value)
 
 bool is_hard_denied(std::string_view basename)
 {
-    return std::find(hard_denied_modules.begin(), hard_denied_modules.end(),
-                     basename) != hard_denied_modules.end();
+    return std::any_of(hard_denied_modules.begin(), hard_denied_modules.end(),
+                       [basename](std::string_view module) {
+                           return basename == module ||
+                                  (basename.starts_with(module) &&
+                                   basename.size() > module.size() &&
+                                   basename[module.size()] == '.');
+                       });
 }
 
 } // namespace

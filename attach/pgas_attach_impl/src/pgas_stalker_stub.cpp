@@ -70,6 +70,19 @@ void pgas_stalker_get_stats(pgas_stalker_ctx_t *ctx, pgas_stalker_stats_t *stats
     }
 }
 
+size_t pgas_stalker_snapshot_threads(pgas_stalker_ctx_t *,
+                                     pgas_stalker_thread_stats_t *, size_t) {
+    return 0;
+}
+
+int pgas_stalker_should_follow_creator(pgas_stalker_ctx_t *, const char *) {
+    return 0;
+}
+
+int pgas_stalker_strict_valid(pgas_stalker_ctx_t *) {
+    return 0;
+}
+
 void pgas_stalker_print_stats(pgas_stalker_ctx_t *ctx) {
     (void)ctx;
 }

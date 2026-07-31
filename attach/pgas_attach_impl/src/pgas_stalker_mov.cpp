@@ -14,6 +14,7 @@
 
 #include "pgas_stalker_mov.hpp"
 #include "pgas_cxlmemsim_integration.hpp"
+#include "pgas_stalker_module_policy.hpp"
 #include "pgas_x86_memory_access.hpp"
 #include <spdlog/spdlog.h>
 #include <array>
@@ -24,7 +25,14 @@
 #include <mutex>
 #include <atomic>
 #include <cerrno>
+#include <algorithm>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
 
+#include <dlfcn.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 using namespace bpftime::attach;
@@ -125,6 +133,10 @@ bool bpftime::attach::pgas_x86_emit_range_gate(
 // Internal context
 // ---------------------------------------------------------------------------
 
+struct stalker_thread_record {
+    pgas_stalker_thread_stats_t stats{};
+};
+
 struct pgas_stalker_ctx {
     GumStalker *stalker;
     GumStalkerTransformer *transformer;
@@ -132,9 +144,141 @@ struct pgas_stalker_ctx {
     pgas_stalker_config_t config;
     pgas_stalker_stats_t stats;
     pgas_x86_runtime *runtime;
+    std::unique_ptr<pgas_stalker_module_policy> module_policy;
+    std::string main_basename;
+    std::mutex module_cache_mutex;
+    std::unordered_map<uintptr_t, bool> module_cache;
+    std::mutex thread_mutex;
+    std::vector<std::unique_ptr<stalker_thread_record>> threads;
+    uint64_t next_runtime_id;
 
-    bool active;
+    std::atomic<bool> active;
 };
+
+static thread_local stalker_thread_record *current_thread_record;
+static thread_local pgas_stalker_ctx *current_thread_context;
+
+static std::string basename_from_path(const char *path)
+{
+    if (path == nullptr || *path == '\0')
+        return {};
+    const char *slash = strrchr(path, '/');
+    return slash == nullptr ? std::string(path) : std::string(slash + 1);
+}
+
+static std::string current_executable_basename()
+{
+    std::array<char, 4096> path{};
+    const ssize_t size = readlink("/proc/self/exe", path.data(),
+                                  path.size() - 1);
+    if (size <= 0)
+        return {};
+    path[static_cast<size_t>(size)] = '\0';
+    return basename_from_path(path.data());
+}
+
+static bool is_main_module(const pgas_stalker_ctx *ctx,
+                           const std::string &basename)
+{
+    return basename.empty() || basename == ctx->main_basename;
+}
+
+static bool should_instrument_address(pgas_stalker_ctx *ctx,
+                                      uint64_t address)
+{
+    Dl_info info{};
+    const bool resolved = dladdr(reinterpret_cast<void *>(address), &info) != 0;
+    const uintptr_t cache_key =
+        resolved && info.dli_fbase != nullptr
+            ? reinterpret_cast<uintptr_t>(info.dli_fbase)
+            : static_cast<uintptr_t>(address >> 12);
+    {
+        std::lock_guard lock(ctx->module_cache_mutex);
+        const auto cached = ctx->module_cache.find(cache_key);
+        if (cached != ctx->module_cache.end())
+            return cached->second;
+    }
+
+    const std::string basename =
+        resolved ? basename_from_path(info.dli_fname) : std::string{};
+    const bool instrument = resolved && ctx->module_policy->should_instrument(
+                                              basename,
+                                              is_main_module(ctx, basename));
+    {
+        std::lock_guard lock(ctx->module_cache_mutex);
+        ctx->module_cache.emplace(cache_key, instrument);
+    }
+    return instrument;
+}
+
+static stalker_thread_record *create_thread_record(pgas_stalker_ctx *ctx,
+                                                    uint64_t os_tid)
+{
+    auto record = std::make_unique<stalker_thread_record>();
+    record->stats.os_tid = os_tid;
+    record->stats.follow_events = 1;
+    auto *result = record.get();
+    std::lock_guard lock(ctx->thread_mutex);
+    record->stats.runtime_id = ctx->next_runtime_id++;
+    ctx->threads.push_back(std::move(record));
+    return result;
+}
+
+static stalker_thread_record *register_current_thread(pgas_stalker_ctx *ctx)
+{
+    if (current_thread_context == ctx && current_thread_record != nullptr) {
+        ++current_thread_record->stats.follow_events;
+        return current_thread_record;
+    }
+
+    auto *result = create_thread_record(
+        ctx, static_cast<uint64_t>(syscall(SYS_gettid)));
+    current_thread_context = ctx;
+    current_thread_record = result;
+    return result;
+}
+
+static stalker_thread_record *bind_current_thread(pgas_stalker_ctx *ctx)
+{
+    if (current_thread_context == ctx && current_thread_record != nullptr)
+        return current_thread_record;
+    const uint64_t os_tid = static_cast<uint64_t>(syscall(SYS_gettid));
+    std::lock_guard lock(ctx->thread_mutex);
+    for (auto iterator = ctx->threads.rbegin(); iterator != ctx->threads.rend();
+         ++iterator) {
+        auto &stats = (*iterator)->stats;
+        if (stats.os_tid == os_tid &&
+            stats.follow_events > stats.unfollow_events) {
+            current_thread_context = ctx;
+            current_thread_record = iterator->get();
+            return current_thread_record;
+        }
+    }
+    return nullptr;
+}
+
+static void unregister_thread_id(pgas_stalker_ctx *ctx, uint64_t os_tid)
+{
+    std::lock_guard lock(ctx->thread_mutex);
+    for (auto iterator = ctx->threads.rbegin(); iterator != ctx->threads.rend();
+         ++iterator) {
+        auto &stats = (*iterator)->stats;
+        if (stats.os_tid == os_tid &&
+            stats.follow_events > stats.unfollow_events) {
+            ++stats.unfollow_events;
+            return;
+        }
+    }
+}
+
+static void unregister_current_thread(pgas_stalker_ctx *ctx)
+{
+    if (current_thread_context != ctx || current_thread_record == nullptr)
+        return;
+    ++current_thread_record->stats.unfollow_events;
+    current_thread_record = nullptr;
+    current_thread_context = nullptr;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers: detect if a Capstone instruction has a memory operand
@@ -411,6 +555,7 @@ struct memory_callout_data {
     uint16_t local_node_id;
     pgas_stalker_stats_t *stats;
     pgas_x86_runtime *runtime;
+    pgas_stalker_ctx *context;
     pgas_x86_memory_descriptor descriptor;
     char labels[5];
 };
@@ -440,6 +585,13 @@ static thread_local pending_access current_access;
     const memory_callout_data *cd, uint64_t effective_address, int error)
 {
     const auto &descriptor = cd->descriptor;
+    if (current_thread_record != nullptr &&
+        current_thread_context == cd->context) {
+        if (error == -ENOTSUP)
+            ++current_thread_record->stats.unsupported;
+        else
+            ++current_thread_record->stats.failures;
+    }
     dprintf(STDERR_FILENO,
             "Splash x86 PGAS validation failure: pc=0x%lx insn=%s(%u) "
             "ea=0x%lx width=%u class=%u error=%d\n",
@@ -451,6 +603,8 @@ static thread_local pending_access current_access;
 
 static void runtime_failure(void *, const pgas_x86_failure &failure)
 {
+    if (current_thread_record != nullptr)
+        ++current_thread_record->stats.failures;
     dprintf(STDERR_FILENO,
             "Splash x86 PGAS transport failure: pc=0x%lx insn=%u "
             "ea=0x%lx width=%zu class=%u segment=%u node=%u error=%d\n",
@@ -484,6 +638,8 @@ static void memory_pre_callout(GumCpuContext *cpu_context, gpointer user_data)
         strict_access_failure(cd, effective_address, -ERANGE);
     if (range == pgas_x86_range_result::overflow)
         strict_access_failure(cd, effective_address, -EOVERFLOW);
+    if (bind_current_thread(cd->context) == nullptr)
+        strict_access_failure(cd, effective_address, -ESRCH);
     if (!cd->descriptor.executable_scalar_mov ||
         cd->descriptor.access_class == pgas_x86_access_class::prefetch)
         strict_access_failure(cd, effective_address, -ENOTSUP);
@@ -515,9 +671,15 @@ static void memory_pre_callout(GumCpuContext *cpu_context, gpointer user_data)
                            __ATOMIC_RELAXED);
     } else if (cd->descriptor.access_class == pgas_x86_access_class::read) {
         __atomic_fetch_add(&cd->stats->remote_loads, 1, __ATOMIC_RELAXED);
+        ++current_thread_record->stats.remote_loads;
+        current_thread_record->stats.bytes_read += cd->descriptor.width;
     } else {
         __atomic_fetch_add(&cd->stats->remote_stores, 1, __ATOMIC_RELAXED);
+        ++current_thread_record->stats.remote_stores;
+        current_thread_record->stats.bytes_written += cd->descriptor.width;
     }
+    if (current_access.event.segments.count > 1)
+        ++current_thread_record->stats.cross_line_splits;
 }
 
 static void memory_post_callout(GumCpuContext *, gpointer)
@@ -620,11 +782,22 @@ static void transform_block(GumStalkerIterator *iterator,
                             GumStalkerOutput *output, gpointer user_data) {
     auto *ctx = (pgas_stalker_ctx *)user_data;
     const cs_insn *insn;
+    bool first_instruction = true;
+    bool instrument_block = false;
 
     __atomic_fetch_add(&ctx->stats.blocks_transformed, 1, __ATOMIC_RELAXED);
 
     while (gum_stalker_iterator_next(iterator, &insn)) {
         __atomic_fetch_add(&ctx->stats.insns_scanned, 1, __ATOMIC_RELAXED);
+
+        if (first_instruction) {
+            instrument_block = should_instrument_address(ctx, insn->address);
+            first_instruction = false;
+        }
+        if (!instrument_block) {
+            gum_stalker_iterator_keep(iterator);
+            continue;
+        }
 
         pgas_x86_memory_descriptor descriptor;
         if (!analyze_memory_instruction(insn, &ctx->config, &descriptor)) {
@@ -674,6 +847,7 @@ static void transform_block(GumStalkerIterator *iterator,
         cd->local_node_id = ctx->config.local_node_id;
         cd->stats = &ctx->stats;
         cd->runtime = ctx->runtime;
+        cd->context = ctx;
         cd->descriptor = descriptor;
 
         emit_memory_access(iterator, output, cd);
@@ -698,7 +872,18 @@ pgas_stalker_ctx_t *pgas_stalker_init(const pgas_stalker_config_t *config) {
     memset(&ctx->stats, 0, sizeof(ctx->stats));
     ctx->config = *config;
     ctx->runtime = nullptr;
+    ctx->next_runtime_id = 1;
     ctx->active = false;
+
+    try {
+        ctx->module_policy = std::make_unique<pgas_stalker_module_policy>(
+            config->include_modules == nullptr ? "" : config->include_modules);
+    } catch (const std::invalid_argument &error) {
+        SPDLOG_ERROR("Invalid PGAS Stalker module allowlist: {}", error.what());
+        delete ctx;
+        return nullptr;
+    }
+    ctx->main_basename = current_executable_basename();
 
     if (!config->hook_mov && !config->hook_movzx &&
         !config->hook_movnti && !config->hook_rep_movs) {
@@ -748,6 +933,7 @@ pgas_stalker_ctx_t *pgas_stalker_init(const pgas_stalker_config_t *config) {
 
 int pgas_stalker_follow_me(pgas_stalker_ctx_t *ctx) {
     if (!ctx || !ctx->stalker) return -1;
+    register_current_thread(ctx);
     gum_stalker_follow_me(ctx->stalker, ctx->transformer, NULL);
     ctx->active = true;
     SPDLOG_INFO("Stalker following current thread");
@@ -756,6 +942,7 @@ int pgas_stalker_follow_me(pgas_stalker_ctx_t *ctx) {
 
 int pgas_stalker_follow(pgas_stalker_ctx_t *ctx, GumThreadId thread_id) {
     if (!ctx || !ctx->stalker) return -1;
+    create_thread_record(ctx, static_cast<uint64_t>(thread_id));
     gum_stalker_follow(ctx->stalker, thread_id, ctx->transformer, NULL);
     ctx->active = true;
     SPDLOG_INFO("Stalker following thread {}", thread_id);
@@ -765,12 +952,14 @@ int pgas_stalker_follow(pgas_stalker_ctx_t *ctx, GumThreadId thread_id) {
 void pgas_stalker_unfollow_me(pgas_stalker_ctx_t *ctx) {
     if (!ctx || !ctx->stalker) return;
     gum_stalker_unfollow_me(ctx->stalker);
+    unregister_current_thread(ctx);
     SPDLOG_INFO("Stalker unfollowed current thread");
 }
 
 void pgas_stalker_unfollow(pgas_stalker_ctx_t *ctx, GumThreadId thread_id) {
     if (!ctx || !ctx->stalker) return;
     gum_stalker_unfollow(ctx->stalker, thread_id);
+    unregister_thread_id(ctx, static_cast<uint64_t>(thread_id));
 }
 
 void pgas_stalker_activate(pgas_stalker_ctx_t *ctx, const void *target) {
@@ -794,6 +983,53 @@ void pgas_stalker_exclude(pgas_stalker_ctx_t *ctx, uint64_t base, uint64_t size)
 void pgas_stalker_get_stats(pgas_stalker_ctx_t *ctx, pgas_stalker_stats_t *stats) {
     if (!ctx || !stats) return;
     *stats = ctx->stats;
+}
+
+size_t pgas_stalker_snapshot_threads(pgas_stalker_ctx_t *ctx,
+                                     pgas_stalker_thread_stats_t *output,
+                                     size_t capacity)
+{
+    if (ctx == nullptr)
+        return 0;
+    std::lock_guard lock(ctx->thread_mutex);
+    const size_t count = ctx->threads.size();
+    if (output != nullptr) {
+        const size_t copy_count = std::min(count, capacity);
+        for (size_t i = 0; i < copy_count; ++i)
+            output[i] = ctx->threads[i]->stats;
+    }
+    return count;
+}
+
+int pgas_stalker_should_follow_creator(pgas_stalker_ctx_t *ctx,
+                                       const char *module_path)
+{
+    if (ctx == nullptr || ctx->module_policy == nullptr)
+        return 0;
+    const std::string basename = basename_from_path(module_path);
+    return ctx->module_policy->should_instrument(
+               basename, is_main_module(ctx, basename))
+               ? 1
+               : 0;
+}
+
+int pgas_stalker_strict_valid(pgas_stalker_ctx_t *ctx)
+{
+    if (ctx == nullptr)
+        return 0;
+    if (!ctx->config.strict_validation)
+        return 1;
+    if (!ctx->module_policy->requested_but_unseen().empty())
+        return 0;
+
+    std::lock_guard lock(ctx->thread_mutex);
+    for (const auto &record : ctx->threads) {
+        const auto &stats = record->stats;
+        if (stats.unsupported != 0 || stats.failures != 0 ||
+            stats.follow_events != stats.unfollow_events)
+            return 0;
+    }
+    return 1;
 }
 
 void pgas_stalker_print_stats(pgas_stalker_ctx_t *ctx) {
