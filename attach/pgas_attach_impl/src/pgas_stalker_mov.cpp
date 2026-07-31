@@ -32,6 +32,7 @@
 #include <unordered_map>
 
 #include <dlfcn.h>
+#include <signal.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -564,6 +565,7 @@ struct memory_callout_data {
     uint64_t pgas_base;
     uint64_t pgas_size;
     uint16_t local_node_id;
+    uint16_t num_nodes;
     pgas_stalker_stats_t *stats;
     pgas_x86_runtime *runtime;
     pgas_stalker_ctx *context;
@@ -592,6 +594,52 @@ struct pending_access {
 
 static thread_local pending_access current_access;
 
+static const char *access_class_name(pgas_x86_access_class access_class)
+{
+    switch (access_class) {
+    case pgas_x86_access_class::read:
+        return "read";
+    case pgas_x86_access_class::write:
+        return "write";
+    case pgas_x86_access_class::read_modify_write:
+        return "read_modify_write";
+    case pgas_x86_access_class::prefetch:
+        return "prefetch";
+    case pgas_x86_access_class::unsupported:
+        return "unsupported";
+    }
+    return "unsupported";
+}
+
+static uint16_t target_node_for(const memory_callout_data *cd,
+                                uint64_t effective_address)
+{
+    if (cd->num_nodes == 0 || cd->pgas_size == 0)
+        return UINT16_MAX;
+    const uint64_t node_size = cd->pgas_size / cd->num_nodes;
+    if (node_size == 0 || effective_address < cd->pgas_base)
+        return UINT16_MAX;
+    uint64_t node = (effective_address - cd->pgas_base) / node_size;
+    if (node >= cd->num_nodes)
+        node = cd->num_nodes - 1;
+    return static_cast<uint16_t>(node);
+}
+
+[[noreturn]] static void emit_fatal_failure(
+    const pgas_x86_failure &failure, const char *unsupported)
+{
+    dprintf(STDERR_FILENO,
+            "PGAS_X86_FAILURE thread_id=%lu pc=0x%lx mnemonic=%s(%u) "
+            "ea=0x%lx width=%zu access_class=%s segment=%u node=%u "
+            "transport_error=%d unsupported=%s\n",
+            failure.thread_id, failure.instruction_address,
+            failure.mnemonic, failure.instruction_id,
+            failure.effective_address, failure.width,
+            access_class_name(failure.access_class), failure.segment_index,
+            failure.target_node, failure.transport_error, unsupported);
+    _exit(128 + SIGBUS);
+}
+
 [[noreturn]] static void strict_access_failure(
     const memory_callout_data *cd, uint64_t effective_address, int error)
 {
@@ -603,28 +651,27 @@ static thread_local pending_access current_access;
         else
             ++current_thread_record->stats.failures;
     }
-    dprintf(STDERR_FILENO,
-            "Splash x86 PGAS validation failure: pc=0x%lx insn=%s(%u) "
-            "ea=0x%lx width=%u class=%u error=%d\n",
-            descriptor.instruction_address, descriptor.mnemonic,
-            descriptor.instruction_id, effective_address, descriptor.width,
-            static_cast<unsigned>(descriptor.access_class), error);
-    _exit(125);
+    pgas_x86_failure failure{};
+    failure.thread_id = static_cast<uint64_t>(syscall(SYS_gettid));
+    failure.instruction_address = descriptor.instruction_address;
+    failure.instruction_id = descriptor.instruction_id;
+    std::memcpy(failure.mnemonic, descriptor.mnemonic,
+                sizeof(failure.mnemonic));
+    failure.access_class = descriptor.access_class;
+    failure.effective_address = effective_address;
+    failure.width = descriptor.width;
+    failure.segment_index = UINT8_MAX;
+    failure.target_node = target_node_for(cd, effective_address);
+    failure.transport_error = error;
+    emit_fatal_failure(failure,
+                       error == -ENOTSUP ? descriptor.mnemonic : "none");
 }
 
 static void runtime_failure(void *, const pgas_x86_failure &failure)
 {
     if (current_thread_record != nullptr)
         ++current_thread_record->stats.failures;
-    dprintf(STDERR_FILENO,
-            "Splash x86 PGAS transport failure: pc=0x%lx insn=%u "
-            "ea=0x%lx width=%zu class=%u segment=%u node=%u error=%d\n",
-            failure.instruction_address, failure.instruction_id,
-            failure.effective_address, failure.width,
-            static_cast<unsigned>(failure.access_class),
-            failure.segment_index, failure.target_node,
-            failure.transport_error);
-    _exit(125);
+    emit_fatal_failure(failure, "none");
 }
 
 static uint64_t read_data_register(const GumCpuContext *cpu, x86_reg reg)
@@ -651,8 +698,11 @@ static void memory_pre_callout(GumCpuContext *cpu_context, gpointer user_data)
         strict_access_failure(cd, effective_address, -EOVERFLOW);
     if (bind_current_thread(cd->context) == nullptr)
         strict_access_failure(cd, effective_address, -ESRCH);
-    if (!cd->descriptor.executable_scalar_mov ||
-        cd->descriptor.access_class == pgas_x86_access_class::prefetch)
+    if (cd->descriptor.access_class == pgas_x86_access_class::prefetch) {
+        ++current_thread_record->stats.unsupported;
+        return;
+    }
+    if (!cd->descriptor.executable_scalar_mov)
         strict_access_failure(cd, effective_address, -ENOTSUP);
     if (current_access.active)
         strict_access_failure(cd, effective_address, -EBUSY);
@@ -856,6 +906,7 @@ static void transform_block(GumStalkerIterator *iterator,
         cd->pgas_base = ctx->config.pgas_base_addr;
         cd->pgas_size = ctx->config.pgas_region_size;
         cd->local_node_id = ctx->config.local_node_id;
+        cd->num_nodes = ctx->config.num_nodes;
         cd->stats = &ctx->stats;
         cd->runtime = ctx->runtime;
         cd->context = ctx;

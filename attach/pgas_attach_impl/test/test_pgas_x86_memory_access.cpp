@@ -271,6 +271,7 @@ TEST_CASE("failed second load segment leaves shadow unchanged",
     REQUIRE(state.failure->segment_index == 1);
     REQUIRE(state.failure->target_node == 0);
     REQUIRE(state.failure->transport_error == -EIO);
+    REQUIRE(std::strcmp(state.failure->mnemonic, "mov") == 0);
     pgas_x86_runtime_destroy(runtime);
 }
 

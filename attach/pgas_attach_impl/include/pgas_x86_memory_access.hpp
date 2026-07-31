@@ -60,6 +60,7 @@ struct pgas_x86_failure {
     uint64_t thread_id{};
     uint64_t instruction_address{};
     unsigned instruction_id{};
+    char mnemonic[32]{};
     pgas_x86_access_class access_class{ pgas_x86_access_class::unsupported };
     uint64_t effective_address{};
     size_t width{};

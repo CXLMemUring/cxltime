@@ -101,17 +101,18 @@ int report_failure(pgas_x86_runtime *runtime, pgas_x86_access_event *event,
         return error;
 
     const auto &descriptor = *event->descriptor;
-    const pgas_x86_failure failure{
-        current_thread_id(),
-        descriptor.instruction_address,
-        descriptor.instruction_id,
-        descriptor.access_class,
-        event->effective_address,
-        descriptor.width,
-        segment_index,
-        event->target_node,
-        error,
-    };
+    pgas_x86_failure failure{};
+    failure.thread_id = current_thread_id();
+    failure.instruction_address = descriptor.instruction_address;
+    failure.instruction_id = descriptor.instruction_id;
+    std::memcpy(failure.mnemonic, descriptor.mnemonic,
+                sizeof(failure.mnemonic));
+    failure.access_class = descriptor.access_class;
+    failure.effective_address = event->effective_address;
+    failure.width = descriptor.width;
+    failure.segment_index = segment_index;
+    failure.target_node = event->target_node;
+    failure.transport_error = error;
     if (runtime->config.fail != nullptr)
         runtime->config.fail(runtime->config.fail_opaque, failure);
     return error;
