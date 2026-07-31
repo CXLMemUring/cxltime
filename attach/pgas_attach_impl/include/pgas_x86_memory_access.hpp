@@ -9,6 +9,33 @@ namespace bpftime::attach {
 
 enum class pgas_x86_range_result { outside, inside, partial, overflow };
 
+enum class pgas_x86_access_class {
+    read,
+    write,
+    read_modify_write,
+    prefetch,
+    unsupported
+};
+
+enum class pgas_x86_register_class { none, gpr, xmm, ymm, zmm };
+
+struct pgas_x86_memory_descriptor {
+    uint64_t instruction_address{};
+    unsigned instruction_id{};
+    char mnemonic[32]{};
+    pgas_x86_access_class access_class{ pgas_x86_access_class::unsupported };
+    uint8_t memory_operand_index{};
+    uint8_t width{};
+    int base_register{};
+    int index_register{};
+    int scale{};
+    int64_t displacement{};
+    int data_register{};
+    pgas_x86_register_class register_class{ pgas_x86_register_class::none };
+    bool atomic{};
+    bool executable_scalar_mov{};
+};
+
 struct pgas_x86_segment {
     uint64_t address{};
     uint8_t offset{};
