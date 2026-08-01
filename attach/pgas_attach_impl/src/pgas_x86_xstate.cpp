@@ -18,6 +18,48 @@ bool range_available(size_t offset, size_t size, size_t limit)
     return offset <= limit && size <= limit - offset;
 }
 
+constexpr uint32_t align_up(uint32_t value, uint32_t alignment)
+{
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+#if defined(__x86_64__)
+bool encode_xsave_memory_operand(GumX86Reg pointer_register, bool restore,
+                                 std::array<guint8, 5> &bytes,
+                                 guint &size)
+{
+    unsigned code{};
+    bool extension{};
+    switch (pointer_register) {
+    case GUM_X86_RAX: code = 0; break;
+    case GUM_X86_RCX: code = 1; break;
+    case GUM_X86_RDX: code = 2; break;
+    case GUM_X86_RBX: code = 3; break;
+    case GUM_X86_RSI: code = 6; break;
+    case GUM_X86_RDI: code = 7; break;
+    case GUM_X86_R8: code = 0; extension = true; break;
+    case GUM_X86_R9: code = 1; extension = true; break;
+    case GUM_X86_R10: code = 2; extension = true; break;
+    case GUM_X86_R11: code = 3; extension = true; break;
+    case GUM_X86_R12: code = 4; extension = true; break;
+    case GUM_X86_R14: code = 6; extension = true; break;
+    case GUM_X86_R15: code = 7; extension = true; break;
+    default: return false;
+    }
+
+    bytes[0] = static_cast<guint8>(0x48 | (extension ? 1 : 0));
+    bytes[1] = 0x0f;
+    bytes[2] = 0xae;
+    bytes[3] = static_cast<guint8>((restore ? 0x28 : 0x20) | code);
+    size = 4;
+    if (code == 4) {
+        bytes[4] = 0x24;
+        size = 5;
+    }
+    return true;
+}
+#endif
+
 int copy_image_range(const pgas_x86_xstate_layout &layout,
                      const std::byte *image, size_t image_size,
                      size_t offset, size_t size, std::byte *destination)
@@ -181,6 +223,151 @@ int pgas_x86_read_opmask(const pgas_x86_xstate_layout &layout,
         return result;
     std::memcpy(&value, bytes.data(), sizeof(value));
     return 0;
+}
+
+bool pgas_x86_emit_state_save(GumX86Writer *writer,
+                              const pgas_x86_xstate_layout &layout,
+                              GumX86Reg pointer_register,
+                              pgas_x86_state_frame &frame)
+{
+#if !defined(__x86_64__)
+    (void)writer;
+    (void)layout;
+    (void)pointer_register;
+    frame = {};
+    return false;
+#else
+    frame = {};
+    std::array<guint8, 5> xsave_bytes{};
+    guint xsave_size{};
+    if (writer == nullptr ||
+        !encode_xsave_memory_operand(pointer_register, false, xsave_bytes,
+                                     xsave_size) ||
+        !layout.osxsave || layout.area_size < 576 ||
+        (layout.enabled_mask & UINT64_C(0x3)) != UINT64_C(0x3))
+        return false;
+
+    constexpr uint32_t red_zone_size = 128;
+    constexpr uint32_t alignment_slack = 64;
+    const uint32_t slots = align_up(layout.area_size + alignment_slack, 8);
+    if (slots > std::numeric_limits<uint32_t>::max() -
+                    red_zone_size - 4 * sizeof(uint64_t))
+        return false;
+    frame.stack_bytes = align_up(
+        red_zone_size + slots + 4 * sizeof(uint64_t), 16);
+    frame.xsave_offset = alignment_slack - 1;
+    frame.saved_rax_offset = slots;
+    frame.saved_rdx_offset = slots + sizeof(uint64_t);
+    frame.saved_pointer_offset = slots + 2 * sizeof(uint64_t);
+    frame.saved_flags_offset = slots + 3 * sizeof(uint64_t);
+    frame.pointer_register = pointer_register;
+
+    if (!gum_x86_writer_put_lea_reg_reg_offset(
+            writer, GUM_X86_RSP, GUM_X86_RSP,
+            -static_cast<gssize>(frame.stack_bytes)) ||
+        !gum_x86_writer_put_mov_reg_offset_ptr_reg(
+            writer, GUM_X86_RSP, frame.saved_rax_offset, GUM_X86_RAX) ||
+        !gum_x86_writer_put_mov_reg_offset_ptr_reg(
+            writer, GUM_X86_RSP, frame.saved_rdx_offset, GUM_X86_RDX) ||
+        !gum_x86_writer_put_mov_reg_offset_ptr_reg(
+            writer, GUM_X86_RSP, frame.saved_pointer_offset,
+            pointer_register))
+        return false;
+
+    gum_x86_writer_put_pushfx(writer);
+    const bool pop_flags =
+        gum_x86_writer_put_pop_reg(writer, pointer_register);
+    const bool store_flags = gum_x86_writer_put_mov_reg_offset_ptr_reg(
+        writer, GUM_X86_RSP, frame.saved_flags_offset, pointer_register);
+    const bool pointer_copy = gum_x86_writer_put_mov_reg_reg(
+        writer, pointer_register, GUM_X86_RSP);
+    const bool pointer_bias = gum_x86_writer_put_add_reg_imm(
+        writer, pointer_register, frame.xsave_offset);
+    const bool pointer_align = gum_x86_writer_put_and_reg_u32(
+        writer, pointer_register, UINT32_C(0xffffffc0));
+    const bool zero_rax =
+        gum_x86_writer_put_mov_reg_u32(writer, GUM_X86_EAX, 0);
+    if (!pop_flags || !store_flags || !pointer_copy || !pointer_bias ||
+        !pointer_align || !zero_rax)
+        return false;
+
+    // XRSTOR requires every reserved byte in the XSAVE header to be zero.
+    for (gssize offset = 512; offset != 576; offset += sizeof(uint64_t)) {
+        if (!gum_x86_writer_put_mov_reg_offset_ptr_reg(
+                writer, pointer_register, offset, GUM_X86_RAX))
+            return false;
+    }
+
+    if (!gum_x86_writer_put_mov_reg_u32(
+            writer, GUM_X86_EAX,
+            static_cast<uint32_t>(layout.enabled_mask)) ||
+        !gum_x86_writer_put_mov_reg_u32(
+            writer, GUM_X86_EDX,
+            static_cast<uint32_t>(layout.enabled_mask >> 32)))
+        return false;
+    gum_x86_writer_put_bytes(writer, xsave_bytes.data(), xsave_size);
+
+    return gum_x86_writer_put_mov_reg_reg_offset_ptr(
+               writer, GUM_X86_RAX, GUM_X86_RSP,
+               frame.saved_rax_offset) &&
+           gum_x86_writer_put_mov_reg_reg_offset_ptr(
+               writer, GUM_X86_RDX, GUM_X86_RSP,
+               frame.saved_rdx_offset);
+#endif
+}
+
+bool pgas_x86_emit_state_restore(GumX86Writer *writer,
+                                 const pgas_x86_xstate_layout &layout,
+                                 const pgas_x86_state_frame &frame)
+{
+#if !defined(__x86_64__)
+    (void)writer;
+    (void)layout;
+    (void)frame;
+    return false;
+#else
+    std::array<guint8, 5> xrstor_bytes{};
+    guint xrstor_size{};
+    if (writer == nullptr ||
+        !encode_xsave_memory_operand(frame.pointer_register, true,
+                                     xrstor_bytes, xrstor_size) ||
+        frame.stack_bytes == 0 || !layout.osxsave ||
+        layout.area_size < 576)
+        return false;
+    if (!gum_x86_writer_put_mov_reg_reg(
+            writer, frame.pointer_register, GUM_X86_RSP) ||
+        !gum_x86_writer_put_add_reg_imm(
+            writer, frame.pointer_register, frame.xsave_offset) ||
+        !gum_x86_writer_put_and_reg_u32(
+            writer, frame.pointer_register, UINT32_C(0xffffffc0)) ||
+        !gum_x86_writer_put_mov_reg_u32(
+            writer, GUM_X86_EAX,
+            static_cast<uint32_t>(layout.enabled_mask)) ||
+        !gum_x86_writer_put_mov_reg_u32(
+            writer, GUM_X86_EDX,
+            static_cast<uint32_t>(layout.enabled_mask >> 32)))
+        return false;
+    gum_x86_writer_put_bytes(writer, xrstor_bytes.data(), xrstor_size);
+
+    if (!gum_x86_writer_put_mov_reg_reg_offset_ptr(
+            writer, GUM_X86_RAX, GUM_X86_RSP,
+            frame.saved_rax_offset) ||
+        !gum_x86_writer_put_mov_reg_reg_offset_ptr(
+            writer, GUM_X86_RDX, GUM_X86_RSP,
+            frame.saved_rdx_offset) ||
+        !gum_x86_writer_put_mov_reg_reg_offset_ptr(
+            writer, frame.pointer_register, GUM_X86_RSP,
+            frame.saved_flags_offset) ||
+        !gum_x86_writer_put_push_reg(writer, frame.pointer_register))
+        return false;
+    gum_x86_writer_put_popfx(writer);
+    if (!gum_x86_writer_put_mov_reg_reg_offset_ptr(
+            writer, frame.pointer_register, GUM_X86_RSP,
+            frame.saved_pointer_offset))
+        return false;
+    return gum_x86_writer_put_lea_reg_reg_offset(
+        writer, GUM_X86_RSP, GUM_X86_RSP, frame.stack_bytes);
+#endif
 }
 
 } // namespace bpftime::attach

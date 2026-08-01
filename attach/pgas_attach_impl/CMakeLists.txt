@@ -127,6 +127,10 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)$")
+        target_compile_options(test_pgas_x86_xstate PRIVATE -mavx512f)
+    endif()
+
     add_test(NAME test_pgas_x86_xstate
         COMMAND test_pgas_x86_xstate)
 

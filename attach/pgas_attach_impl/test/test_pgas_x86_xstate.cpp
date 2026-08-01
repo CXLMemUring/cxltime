@@ -4,9 +4,11 @@
 #include "pgas_x86_xstate.hpp"
 
 #include <array>
+#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 using namespace bpftime::attach;
@@ -29,6 +31,18 @@ pgas_x86_xstate_layout avx512_layout()
 }
 
 } // namespace
+
+#if defined(__x86_64__)
+extern "C" __attribute__((naked)) void pgas_x86_test_clobber_xstate()
+{
+    asm volatile("vpxord %zmm0, %zmm0, %zmm0\n\t"
+                 "kxnorq %k1, %k1, %k1\n\t"
+                 "xor %eax, %eax\n\t"
+                 "xor %edx, %edx\n\t"
+                 "mov $0x55, %r11d\n\t"
+                 "ret\n\t");
+}
+#endif
 
 TEST_CASE("standard xsave image reconstructs zmm", "[pgas][x86][xstate]")
 {
@@ -127,3 +141,86 @@ TEST_CASE("live host exposes AVX-512 xstate", "[pgas][x86][xstate][live]")
     REQUIRE(layout.component[6].enabled);
     REQUIRE(layout.component[7].enabled);
 }
+
+TEST_CASE("xstate envelope emits xsave64 and xrstor64",
+          "[pgas][x86][xstate][writer]")
+{
+    pgas_x86_xstate_layout layout{};
+    REQUIRE(pgas_x86_detect_xstate(layout) == 0);
+    std::array<uint8_t, 512> code{};
+    GumX86Writer writer;
+    gum_x86_writer_init(&writer, code.data());
+    pgas_x86_state_frame frame{};
+    REQUIRE(pgas_x86_emit_state_save(&writer, layout, GUM_X86_R11, frame));
+    REQUIRE(pgas_x86_emit_state_restore(&writer, layout, frame));
+    gum_x86_writer_put_ret(&writer);
+    REQUIRE(gum_x86_writer_flush(&writer));
+
+    const auto end = code.begin() + gum_x86_writer_offset(&writer);
+    const std::array<uint8_t, 4> xsave{ 0x49, 0x0f, 0xae, 0x23 };
+    const std::array<uint8_t, 4> xrstor{ 0x49, 0x0f, 0xae, 0x2b };
+    REQUIRE(std::search(code.begin(), end, xsave.begin(), xsave.end()) != end);
+    REQUIRE(std::search(code.begin(), end, xrstor.begin(), xrstor.end()) !=
+            end);
+    gum_x86_writer_clear(&writer);
+}
+
+#if defined(__x86_64__)
+TEST_CASE("live envelope preserves flags zmm and opmask across a clobber",
+          "[pgas][x86][xstate][writer][live]")
+{
+    constexpr uint64_t expected_mask = UINT64_C(0x5a3c);
+    constexpr uint64_t input_flags = UINT64_C(0x246);
+    constexpr uint64_t arithmetic_flags = UINT64_C(0x8d5);
+    alignas(64) std::array<uint8_t, 64> expected{};
+    alignas(64) std::array<uint8_t, 64> actual{};
+    for (size_t i = 0; i < expected.size(); ++i)
+        expected[i] = static_cast<uint8_t>(0x80 + i);
+
+    pgas_x86_xstate_layout layout{};
+    REQUIRE(pgas_x86_detect_xstate(layout) == 0);
+    gum_init_embedded();
+    auto *code = static_cast<uint8_t *>(gum_alloc_n_pages(1, GUM_PAGE_RWX));
+    REQUIRE(code != nullptr);
+    GumX86Writer writer;
+    gum_x86_writer_init(&writer, code);
+    pgas_x86_state_frame frame{};
+    REQUIRE(pgas_x86_emit_state_save(&writer, layout, GUM_X86_R11, frame));
+    REQUIRE(gum_x86_writer_put_mov_reg_u64(
+        &writer, GUM_X86_RAX,
+        reinterpret_cast<uint64_t>(&pgas_x86_test_clobber_xstate)));
+    REQUIRE(gum_x86_writer_put_call_reg(&writer, GUM_X86_RAX));
+    REQUIRE(pgas_x86_emit_state_restore(&writer, layout, frame));
+    gum_x86_writer_put_ret(&writer);
+    REQUIRE(gum_x86_writer_flush(&writer));
+
+    uint64_t actual_mask{};
+    uint64_t actual_flags{};
+    const auto function = reinterpret_cast<void (*)()>(code);
+    asm volatile("vmovdqu64 %[expected], %%zmm0\n\t"
+                 "kmovq %[expected_mask], %%k1\n\t"
+                 "push %[input_flags]\n\t"
+                 "popfq\n\t"
+                 "call *%[function]\n\t"
+                 "pushfq\n\t"
+                 "pop %[actual_flags]\n\t"
+                 "vmovdqu64 %%zmm0, %[actual]\n\t"
+                 "kmovq %%k1, %[actual_mask]\n\t"
+                 : [actual] "=m"(actual),
+                   [actual_mask] "=r"(actual_mask),
+                   [actual_flags] "=r"(actual_flags)
+                 : [expected] "m"(expected),
+                   [expected_mask] "r"(expected_mask),
+                   [input_flags] "r"(input_flags),
+                   [function] "r"(function)
+                 : "rax", "rdx", "r11", "zmm0", "k1", "memory", "cc");
+
+    REQUIRE(actual == expected);
+    REQUIRE(actual_mask == expected_mask);
+    REQUIRE((actual_flags & arithmetic_flags) ==
+            (input_flags & arithmetic_flags));
+    gum_x86_writer_clear(&writer);
+    gum_free_pages(code);
+    gum_deinit_embedded();
+}
+#endif

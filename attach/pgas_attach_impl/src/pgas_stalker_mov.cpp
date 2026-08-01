@@ -16,6 +16,7 @@
 #include "pgas_cxlmemsim_integration.hpp"
 #include "pgas_stalker_module_policy.hpp"
 #include "pgas_x86_memory_access.hpp"
+#include "pgas_x86_xstate.hpp"
 #include <spdlog/spdlog.h>
 #include <array>
 #include <cstring>
@@ -156,6 +157,7 @@ struct pgas_stalker_ctx {
     pgas_stalker_config_t config;
     pgas_stalker_stats_t stats;
     pgas_x86_runtime *runtime;
+    pgas_x86_xstate_layout xstate;
     std::unique_ptr<pgas_stalker_module_policy> module_policy;
     std::string main_basename;
     std::mutex module_cache_mutex;
@@ -571,6 +573,7 @@ struct memory_callout_data {
     pgas_x86_runtime *runtime;
     pgas_stalker_ctx *context;
     pgas_x86_memory_descriptor descriptor;
+    GumX86Reg xstate_pointer;
     char labels[5];
 };
 
@@ -779,12 +782,53 @@ static bool choose_scratch_registers(
     return false;
 }
 
+static bool choose_xstate_pointer(
+    const pgas_x86_memory_descriptor &descriptor, GumX86Reg &pointer)
+{
+    constexpr std::array candidates{
+        GUM_X86_R11, GUM_X86_R10, GUM_X86_R9,  GUM_X86_R8,
+        GUM_X86_RBX, GUM_X86_RCX, GUM_X86_RSI, GUM_X86_RDI,
+        GUM_X86_R14, GUM_X86_R15, GUM_X86_R12,
+    };
+    const GumX86Reg base =
+        cs_to_gum_reg(static_cast<x86_reg>(descriptor.base_register));
+    const GumX86Reg index =
+        cs_to_gum_reg(static_cast<x86_reg>(descriptor.index_register));
+    const GumX86Reg data =
+        cs_to_gum_reg(static_cast<x86_reg>(descriptor.data_register));
+    for (const auto candidate : candidates) {
+        if (candidate != base && candidate != index && candidate != data) {
+            pointer = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void emit_enveloped_callout(GumStalkerIterator *iterator,
+                                   GumX86Writer *writer,
+                                   memory_callout_data *cd,
+                                   GumStalkerCallout callout)
+{
+    pgas_x86_state_frame frame{};
+    if (!pgas_x86_emit_state_save(writer, cd->context->xstate,
+                                  cd->xstate_pointer, frame))
+        strict_access_failure(cd, cd->descriptor.instruction_address,
+                              -ENOTSUP);
+    gum_stalker_iterator_put_callout(iterator, callout, cd, nullptr);
+    if (!pgas_x86_emit_state_restore(writer, cd->context->xstate, frame))
+        strict_access_failure(cd, cd->descriptor.instruction_address,
+                              -ENOTSUP);
+}
+
 static void emit_memory_access(GumStalkerIterator *iterator,
                                GumStalkerOutput *output,
                                memory_callout_data *cd)
 {
     auto *writer = output->writer.x86;
     const auto &descriptor = cd->descriptor;
+    if (!choose_xstate_pointer(descriptor, cd->xstate_pointer))
+        strict_access_failure(cd, descriptor.instruction_address, -ENOTSUP);
     const bool simple_address =
         descriptor.base_register != X86_REG_INVALID &&
         descriptor.base_register != X86_REG_RIP &&
@@ -794,11 +838,9 @@ static void emit_memory_access(GumStalkerIterator *iterator,
                             choose_scratch_registers(descriptor, scratch);
 
     if (!can_inline) {
-        gum_stalker_iterator_put_callout(iterator, memory_pre_callout, cd,
-                                         nullptr);
+        emit_enveloped_callout(iterator, writer, cd, memory_pre_callout);
         gum_stalker_iterator_keep(iterator);
-        gum_stalker_iterator_put_callout(iterator, memory_post_callout, cd,
-                                         nullptr);
+        emit_enveloped_callout(iterator, writer, cd, memory_post_callout);
         return;
     }
 
@@ -817,23 +859,23 @@ static void emit_memory_access(GumStalkerIterator *iterator,
     }
 
     gum_x86_writer_put_label(writer, inside);
-    gum_stalker_iterator_put_callout(iterator, memory_pre_callout, cd, nullptr);
+    emit_enveloped_callout(iterator, writer, cd, memory_pre_callout);
     gum_x86_writer_put_jmp_near_label(writer, original);
 
     gum_x86_writer_put_label(writer, outside);
     gum_x86_writer_put_jmp_near_label(writer, original);
 
     gum_x86_writer_put_label(writer, partial);
-    gum_stalker_iterator_put_callout(iterator, memory_pre_callout, cd, nullptr);
+    emit_enveloped_callout(iterator, writer, cd, memory_pre_callout);
     gum_x86_writer_put_breakpoint(writer);
 
     gum_x86_writer_put_label(writer, overflow);
-    gum_stalker_iterator_put_callout(iterator, memory_pre_callout, cd, nullptr);
+    emit_enveloped_callout(iterator, writer, cd, memory_pre_callout);
     gum_x86_writer_put_breakpoint(writer);
 
     gum_x86_writer_put_label(writer, original);
     gum_stalker_iterator_keep(iterator);
-    gum_stalker_iterator_put_callout(iterator, memory_post_callout, cd, nullptr);
+    emit_enveloped_callout(iterator, writer, cd, memory_post_callout);
 }
 
 // ---------------------------------------------------------------------------
@@ -959,6 +1001,13 @@ pgas_stalker_ctx_t *pgas_stalker_init(const pgas_stalker_config_t *config) {
     ctx->runtime = nullptr;
     ctx->next_runtime_id = 1;
     ctx->active = false;
+
+    if (pgas_x86_detect_xstate(ctx->xstate) != 0 ||
+        !ctx->xstate.osxsave || !ctx->xstate.avx || !ctx->xstate.avx512) {
+        SPDLOG_ERROR("Required x86 XSAVE/AVX/AVX-512 state is unavailable");
+        delete ctx;
+        return nullptr;
+    }
 
     try {
         ctx->module_policy = std::make_unique<pgas_stalker_module_policy>(
