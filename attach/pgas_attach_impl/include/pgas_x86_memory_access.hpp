@@ -31,9 +31,16 @@ struct pgas_x86_memory_descriptor {
     int scale{};
     int64_t displacement{};
     int data_register{};
+    int vector_index_register{};
+    int mask_register{};
     pgas_x86_register_class register_class{ pgas_x86_register_class::none };
+    uint8_t lane_width{};
+    uint8_t index_width{};
+    uint8_t lane_count{};
     bool atomic{};
     bool replayable{};
+    bool gather{};
+    bool scatter{};
 };
 
 struct pgas_x86_segment {

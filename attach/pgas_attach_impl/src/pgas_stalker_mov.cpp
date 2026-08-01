@@ -404,6 +404,32 @@ static bool is_prefetch_instruction(const cs_insn *insn)
     return strncmp(insn->mnemonic, "prefetch", 8) == 0;
 }
 
+static bool is_gather_instruction(const cs_insn *insn)
+{
+    return insn->id == X86_INS_VPGATHERDD;
+}
+
+static bool is_scatter_instruction(const cs_insn *insn)
+{
+    return insn->id == X86_INS_VPSCATTERDD;
+}
+
+static bool is_opmask(x86_reg reg)
+{
+    return reg >= X86_REG_K0 && reg <= X86_REG_K7;
+}
+
+static uint8_t vector_register_bytes(x86_reg reg)
+{
+    if (reg >= X86_REG_XMM0 && reg <= X86_REG_XMM31)
+        return 16;
+    if (reg >= X86_REG_YMM0 && reg <= X86_REG_YMM31)
+        return 32;
+    if (reg >= X86_REG_ZMM0 && reg <= X86_REG_ZMM31)
+        return 64;
+    return 0;
+}
+
 // OPT 1: Skip stack-relative memory accesses at JIT time.
 // RSP/RBP-based movs are local stack variables — never CXL addresses.
 static bool is_stack_relative(x86_reg reg) {
@@ -428,6 +454,8 @@ static bool analyze_memory_instruction(
     out->instruction_id = insn->id;
     snprintf(out->mnemonic, sizeof(out->mnemonic), "%s", insn->mnemonic);
     out->atomic = is_atomic_instruction(insn);
+    out->gather = is_gather_instruction(insn);
+    out->scatter = is_scatter_instruction(insn);
     const cs_x86 *x86 = &insn->detail->x86;
     uint8_t memory_count = 0;
     for (uint8_t i = 0; i < x86->op_count; i++) {
@@ -438,12 +466,17 @@ static bool analyze_memory_instruction(
             out->memory_operand_index = i;
             out->base_register = x86->operands[i].mem.base;
             out->index_register = x86->operands[i].mem.index;
+            out->vector_index_register = x86->operands[i].mem.index;
             out->scale = x86->operands[i].mem.scale;
             out->displacement = x86->operands[i].mem.disp;
             out->width = x86->operands[i].size;
 
             const auto access = x86->operands[i].access;
-            if (is_prefetch_instruction(insn)) {
+            if (out->gather) {
+                out->access_class = pgas_x86_access_class::read;
+            } else if (out->scatter) {
+                out->access_class = pgas_x86_access_class::write;
+            } else if (is_prefetch_instruction(insn)) {
                 out->access_class = pgas_x86_access_class::prefetch;
             } else if (is_mov_insn(insn->id)) {
                 out->access_class =
@@ -469,10 +502,33 @@ static bool analyze_memory_instruction(
         if (i == out->memory_operand_index)
             continue;
         if (x86->operands[i].type == X86_OP_REG) {
+            const auto operand_reg =
+                static_cast<x86_reg>(x86->operands[i].reg);
+            if (is_opmask(operand_reg)) {
+                out->mask_register = operand_reg;
+                continue;
+            }
             out->data_register = x86->operands[i].reg;
             out->register_class =
                 register_class(static_cast<x86_reg>(out->data_register));
             break;
+        }
+    }
+
+    if (out->gather || out->scatter) {
+        out->lane_width = 4;
+        out->index_width = 4;
+        const uint8_t index_bytes = vector_register_bytes(
+            static_cast<x86_reg>(out->vector_index_register));
+        out->lane_count = index_bytes / out->index_width;
+        if (out->mask_register == X86_REG_INVALID) {
+            for (uint8_t i = 0; i < x86->op_count; ++i) {
+                if (x86->operands[i].type != X86_OP_REG ||
+                    x86->operands[i].reg == out->data_register ||
+                    x86->operands[i].reg == out->vector_index_register)
+                    continue;
+                out->mask_register = x86->operands[i].reg;
+            }
         }
     }
 
@@ -483,8 +539,12 @@ static bool analyze_memory_instruction(
         (index == X86_REG_INVALID || is_gpr(index));
     const bool configured_mov = !is_mov_insn(insn->id) ||
                                 mov_is_enabled(insn->id, cfg);
+    const bool lane_access = (out->gather || out->scatter) &&
+                             out->lane_count != 0 &&
+                             out->mask_register != X86_REG_INVALID;
     out->replayable = memory_count == 1 && out->width >= 1 &&
-                      out->width <= 64 && scalar_address && configured_mov &&
+                      out->width <= 64 &&
+                      (scalar_address || lane_access) && configured_mov &&
                       out->access_class != pgas_x86_access_class::unsupported;
     return true;
 }
@@ -568,6 +628,49 @@ static uint64_t compute_ea(const GumCpuContext *cpu,
     return ea;
 }
 
+static uint64_t read_gum_register(const GumCpuContext *cpu, GumX86Reg reg)
+{
+    switch (reg) {
+    case GUM_X86_RAX: return cpu->rax;
+    case GUM_X86_RBX: return cpu->rbx;
+    case GUM_X86_RCX: return cpu->rcx;
+    case GUM_X86_RDX: return cpu->rdx;
+    case GUM_X86_RSI: return cpu->rsi;
+    case GUM_X86_RDI: return cpu->rdi;
+    case GUM_X86_R8: return cpu->r8;
+    case GUM_X86_R9: return cpu->r9;
+    case GUM_X86_R10: return cpu->r10;
+    case GUM_X86_R11: return cpu->r11;
+    case GUM_X86_R12: return cpu->r12;
+    case GUM_X86_R14: return cpu->r14;
+    case GUM_X86_R15: return cpu->r15;
+    default: return 0;
+    }
+}
+
+static int vector_register_index(x86_reg reg)
+{
+    if (reg >= X86_REG_XMM0 && reg <= X86_REG_XMM31)
+        return reg - X86_REG_XMM0;
+    if (reg >= X86_REG_YMM0 && reg <= X86_REG_YMM31)
+        return reg - X86_REG_YMM0;
+    if (reg >= X86_REG_ZMM0 && reg <= X86_REG_ZMM31)
+        return reg - X86_REG_ZMM0;
+    return -1;
+}
+
+static bool add_signed_offset(uint64_t base, int64_t offset, uint64_t &result)
+{
+    if (offset >= 0)
+        return !__builtin_add_overflow(base, static_cast<uint64_t>(offset),
+                                       &result);
+    const uint64_t magnitude = static_cast<uint64_t>(-(offset + 1)) + 1;
+    if (base < magnitude)
+        return false;
+    result = base - magnitude;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // OPT 4: Lock-free bump allocator for callout metadata
 // ---------------------------------------------------------------------------
@@ -584,6 +687,91 @@ struct memory_callout_data {
     GumX86Reg xstate_pointer;
     char labels[5];
 };
+
+static int plan_vector_lanes(const GumCpuContext *cpu,
+                             const memory_callout_data *cd,
+                             pgas_x86_replay_plan &plan)
+{
+    const auto &descriptor = cd->descriptor;
+    const int index_register = vector_register_index(
+        static_cast<x86_reg>(descriptor.vector_index_register));
+    if (index_register < 0 || descriptor.index_width != 4 ||
+        descriptor.lane_width != 4 || descriptor.lane_count == 0 ||
+        descriptor.lane_count > 16)
+        return -ENOTSUP;
+
+    const auto *xstate = reinterpret_cast<const std::byte *>(
+        read_gum_register(cpu, cd->xstate_pointer));
+    if (xstate == nullptr)
+        return -EINVAL;
+    const size_t vector_size = descriptor.lane_count * descriptor.index_width;
+    std::array<std::byte, 64> index_bytes{};
+    int result = pgas_x86_read_vector(
+        cd->context->xstate, xstate, cd->context->xstate.area_size,
+        static_cast<unsigned>(index_register), index_bytes.data(),
+        vector_size);
+    if (result != 0)
+        return result;
+
+    uint64_t active_mask{};
+    const auto mask_reg = static_cast<x86_reg>(descriptor.mask_register);
+    if (is_opmask(mask_reg)) {
+        result = pgas_x86_read_opmask(
+            cd->context->xstate, xstate, cd->context->xstate.area_size,
+            static_cast<unsigned>(mask_reg - X86_REG_K0), active_mask);
+        if (result != 0)
+            return result;
+    } else {
+        const int mask_register = vector_register_index(mask_reg);
+        if (mask_register < 0)
+            return -ENOTSUP;
+        std::array<std::byte, 64> mask_bytes{};
+        result = pgas_x86_read_vector(
+            cd->context->xstate, xstate, cd->context->xstate.area_size,
+            static_cast<unsigned>(mask_register), mask_bytes.data(),
+            vector_size);
+        if (result != 0)
+            return result;
+        for (size_t lane = 0; lane < descriptor.lane_count; ++lane) {
+            int32_t mask_value{};
+            std::memcpy(&mask_value,
+                        mask_bytes.data() + lane * descriptor.index_width,
+                        sizeof(mask_value));
+            if (mask_value < 0)
+                active_mask |= UINT64_C(1) << lane;
+        }
+    }
+
+    uint64_t base_address{};
+    if (descriptor.base_register != X86_REG_INVALID)
+        base_address = read_reg(
+            cpu, static_cast<x86_reg>(descriptor.base_register));
+    if (!add_signed_offset(base_address, descriptor.displacement,
+                           base_address))
+        return -EOVERFLOW;
+
+    std::array<uint64_t, 16> addresses{};
+    for (size_t lane = 0; lane < descriptor.lane_count; ++lane) {
+        if ((active_mask & (UINT64_C(1) << lane)) == 0)
+            continue;
+        int32_t index{};
+        std::memcpy(&index,
+                    index_bytes.data() + lane * descriptor.index_width,
+                    sizeof(index));
+        const int64_t scaled = static_cast<int64_t>(index) * descriptor.scale;
+        if (!add_signed_offset(base_address, scaled, addresses[lane]))
+            return -EOVERFLOW;
+    }
+
+    const pgas_x86_runtime_config config{
+        cd->pgas_base, cd->pgas_size, cd->local_node_id, cd->num_nodes, {},
+        nullptr, nullptr
+    };
+    plan = pgas_x86_plan_lanes(config, addresses.data(),
+                               descriptor.lane_count,
+                               descriptor.lane_width, active_mask);
+    return plan.status;
+}
 
 // Bump allocator: single contiguous block, no locks, no free
 #define CALLOUT_POOL_CAPACITY (1024 * 1024)
@@ -710,8 +898,15 @@ static void memory_pre_callout(GumCpuContext *cpu_context, gpointer user_data)
         cd->pgas_base, cd->pgas_size, cd->local_node_id, cd->num_nodes, {},
         nullptr, nullptr
     };
-    const auto plan = pgas_x86_plan_contiguous(
-        plan_config, effective_address, cd->descriptor.width);
+    pgas_x86_replay_plan plan{};
+    if (cd->descriptor.gather || cd->descriptor.scatter) {
+        const int lane_result = plan_vector_lanes(cpu_context, cd, plan);
+        if (lane_result != 0)
+            strict_access_failure(cd, effective_address, lane_result);
+    } else {
+        plan = pgas_x86_plan_contiguous(
+            plan_config, effective_address, cd->descriptor.width);
+    }
     if (plan.status != 0)
         strict_access_failure(cd, effective_address, plan.status);
     current_access = {};
