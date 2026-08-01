@@ -110,4 +110,17 @@ int pgas_x86_begin_store(pgas_x86_runtime *runtime,
                          size_t source_size);
 void pgas_x86_finish_access(pgas_x86_access_event *event);
 
+// Internal bridge used by the bounded replay transaction implementation.
+int pgas_x86_runtime_lock_lines(pgas_x86_runtime *runtime,
+                                const uint64_t *lines, size_t line_count,
+                                uint16_t *stripes, size_t stripe_capacity,
+                                uint16_t &acquired);
+void pgas_x86_runtime_unlock_lines(pgas_x86_runtime *runtime,
+                                   const uint16_t *stripes,
+                                   uint16_t acquired);
+int pgas_x86_runtime_read(pgas_x86_runtime *runtime, uint16_t node,
+                          uint64_t address, void *destination, size_t size);
+int pgas_x86_runtime_write(pgas_x86_runtime *runtime, uint16_t node,
+                           uint64_t address, const void *source, size_t size);
+
 } // namespace bpftime::attach

@@ -287,4 +287,104 @@ void pgas_x86_finish_access(pgas_x86_access_event *event)
     release_locks(event);
 }
 
+int pgas_x86_runtime_lock_lines(pgas_x86_runtime *runtime,
+                                const uint64_t *lines, size_t line_count,
+                                uint16_t *stripes, size_t stripe_capacity,
+                                uint16_t &acquired)
+{
+    acquired = 0;
+    if (runtime == nullptr || (line_count != 0 && lines == nullptr) ||
+        (line_count != 0 && stripes == nullptr) ||
+        line_count > stripe_capacity || line_count > lock_stripe_count)
+        return -EINVAL;
+
+    for (size_t i = 0; i < line_count; ++i) {
+        const uint64_t cache_line = lines[i] / cache_line_size;
+        stripes[i] =
+            static_cast<uint16_t>(cache_line % lock_stripe_count);
+    }
+    std::sort(stripes, stripes + line_count);
+    const auto *unique_end = std::unique(stripes, stripes + line_count);
+    const size_t unique_count = unique_end - stripes;
+    for (size_t i = 0; i < unique_count; ++i) {
+        while (runtime->line_locks[stripes[i]].test_and_set(
+            std::memory_order_acquire))
+            std::this_thread::yield();
+        ++acquired;
+    }
+    return 0;
+}
+
+void pgas_x86_runtime_unlock_lines(pgas_x86_runtime *runtime,
+                                   const uint16_t *stripes,
+                                   uint16_t acquired)
+{
+    if (runtime == nullptr || stripes == nullptr)
+        return;
+    while (acquired != 0) {
+        --acquired;
+        runtime->line_locks[stripes[acquired]].clear(
+            std::memory_order_release);
+    }
+}
+
+namespace {
+
+int translate_transport_address(pgas_x86_runtime *runtime, uint16_t node,
+                                uint64_t address, size_t size,
+                                uint64_t &node_offset)
+{
+    if (runtime == nullptr || size == 0 || node >= runtime->config.num_nodes)
+        return -EINVAL;
+    const uint64_t node_size =
+        runtime->config.pgas_size / runtime->config.num_nodes;
+    if (node_size == 0)
+        return -EINVAL;
+    const uint64_t node_base =
+        runtime->config.pgas_base + static_cast<uint64_t>(node) * node_size;
+    const uint64_t node_end =
+        node + 1 == runtime->config.num_nodes
+            ? runtime->config.pgas_base + runtime->config.pgas_size
+            : node_base + node_size;
+    uint64_t access_end{};
+    if (__builtin_add_overflow(address, static_cast<uint64_t>(size),
+                               &access_end))
+        return -EOVERFLOW;
+    if (address < node_base || access_end > node_end)
+        return -ERANGE;
+    node_offset = address - node_base;
+    return 0;
+}
+
+} // namespace
+
+int pgas_x86_runtime_read(pgas_x86_runtime *runtime, uint16_t node,
+                          uint64_t address, void *destination, size_t size)
+{
+    if (destination == nullptr)
+        return -EINVAL;
+    uint64_t node_offset{};
+    const int result = translate_transport_address(
+        runtime, node, address, size, node_offset);
+    if (result != 0)
+        return result;
+    return runtime->config.transport.read(runtime->config.transport.opaque,
+                                          node, node_offset, destination,
+                                          size);
+}
+
+int pgas_x86_runtime_write(pgas_x86_runtime *runtime, uint16_t node,
+                           uint64_t address, const void *source, size_t size)
+{
+    if (source == nullptr)
+        return -EINVAL;
+    uint64_t node_offset{};
+    const int result = translate_transport_address(
+        runtime, node, address, size, node_offset);
+    if (result != 0)
+        return result;
+    return runtime->config.transport.write(runtime->config.transport.opaque,
+                                           node, node_offset, source, size);
+}
+
 } // namespace bpftime::attach

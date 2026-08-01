@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstring>
 #include <limits>
 
 namespace bpftime::attach {
@@ -94,6 +95,19 @@ void finalize_locks(pgas_x86_replay_plan &plan)
     plan.lock_count = static_cast<uint16_t>(std::unique(begin, end) - begin);
 }
 
+bool access_reads_shadow(pgas_x86_access_class access)
+{
+    return access == pgas_x86_access_class::read ||
+           access == pgas_x86_access_class::read_modify_write ||
+           access == pgas_x86_access_class::prefetch;
+}
+
+bool access_writes_shadow(pgas_x86_access_class access)
+{
+    return access == pgas_x86_access_class::write ||
+           access == pgas_x86_access_class::read_modify_write;
+}
+
 } // namespace
 
 pgas_x86_replay_plan
@@ -161,6 +175,115 @@ pgas_x86_plan_lanes(const pgas_x86_runtime_config &config,
 
     finalize_locks(plan);
     return plan;
+}
+
+int pgas_x86_replay_prepare(pgas_x86_runtime *runtime,
+                            pgas_x86_replay_transaction &transaction,
+                            const pgas_x86_replay_plan &plan,
+                            pgas_x86_access_class access)
+{
+    if (runtime == nullptr || transaction.active || plan.status != 0 ||
+        plan.fragment_count > plan.fragments.size() ||
+        plan.lock_count > plan.lock_lines.size() ||
+        (!access_reads_shadow(access) && !access_writes_shadow(access)))
+        return -EINVAL;
+
+    transaction.plan = plan;
+    transaction.access = access;
+    transaction.runtime = runtime;
+    transaction.acquired_locks = 0;
+    transaction.status = 0;
+    transaction.failed = false;
+
+    int result = pgas_x86_runtime_lock_lines(
+        runtime, plan.lock_lines.data(), plan.lock_count,
+        transaction.lock_stripes.data(), transaction.lock_stripes.size(),
+        transaction.acquired_locks);
+    if (result != 0) {
+        transaction.status = result;
+        transaction.failed = true;
+        transaction.runtime = nullptr;
+        return result;
+    }
+    transaction.active = true;
+
+    if (!access_reads_shadow(access))
+        return 0;
+
+    for (size_t i = 0; i < plan.fragment_count; ++i) {
+        const auto &fragment = plan.fragments[i];
+        const size_t staging_end =
+            static_cast<size_t>(fragment.byte_offset) + fragment.size;
+        if (staging_end > transaction.staging.size()) {
+            result = -E2BIG;
+            break;
+        }
+        if (!fragment.remote)
+            continue;
+        result = pgas_x86_runtime_read(
+            runtime, fragment.node, fragment.address,
+            transaction.staging.data() + fragment.byte_offset,
+            fragment.size);
+        if (result != 0)
+            break;
+    }
+
+    if (result == 0) {
+        for (size_t i = 0; i < plan.fragment_count; ++i) {
+            const auto &fragment = plan.fragments[i];
+            if (!fragment.remote)
+                continue;
+            std::memcpy(reinterpret_cast<void *>(fragment.address),
+                        transaction.staging.data() + fragment.byte_offset,
+                        fragment.size);
+        }
+        return 0;
+    }
+
+    transaction.status = result;
+    transaction.failed = true;
+    pgas_x86_replay_abort(transaction);
+    return result;
+}
+
+int pgas_x86_replay_commit(pgas_x86_replay_transaction &transaction)
+{
+    if (!transaction.active || transaction.runtime == nullptr)
+        return -EINVAL;
+    if (transaction.failed)
+        return transaction.status != 0 ? transaction.status : -EIO;
+
+    if (access_writes_shadow(transaction.access)) {
+        for (size_t i = 0; i < transaction.plan.fragment_count; ++i) {
+            const auto &fragment = transaction.plan.fragments[i];
+            if (!fragment.remote)
+                continue;
+            const int result = pgas_x86_runtime_write(
+                transaction.runtime, fragment.node, fragment.address,
+                reinterpret_cast<const void *>(fragment.address),
+                fragment.size);
+            if (result != 0) {
+                transaction.status = result;
+                transaction.failed = true;
+                return result;
+            }
+        }
+    }
+
+    pgas_x86_replay_abort(transaction);
+    return 0;
+}
+
+void pgas_x86_replay_abort(pgas_x86_replay_transaction &transaction)
+{
+    if (transaction.active && transaction.runtime != nullptr) {
+        pgas_x86_runtime_unlock_lines(
+            transaction.runtime, transaction.lock_stripes.data(),
+            transaction.acquired_locks);
+    }
+    transaction.acquired_locks = 0;
+    transaction.active = false;
+    transaction.runtime = nullptr;
 }
 
 } // namespace bpftime::attach
