@@ -158,7 +158,7 @@ pgas_x86_memory_descriptor scalar_descriptor(pgas_x86_access_class access)
     descriptor.access_class = access;
     descriptor.width = 8;
     descriptor.register_class = pgas_x86_register_class::gpr;
-    descriptor.executable_scalar_mov = true;
+    descriptor.replayable = true;
     return descriptor;
 }
 

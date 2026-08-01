@@ -31,7 +31,7 @@ TEST_CASE("x86 memory descriptors preserve decoded metadata",
     descriptor.data_register = 5;
     descriptor.register_class = pgas_x86_register_class::gpr;
     descriptor.atomic = false;
-    descriptor.executable_scalar_mov = true;
+    descriptor.replayable = true;
 
     REQUIRE(descriptor.instruction_address == 0x123456789abcdef0ULL);
     REQUIRE(descriptor.instruction_id == 17);
@@ -46,7 +46,7 @@ TEST_CASE("x86 memory descriptors preserve decoded metadata",
     REQUIRE(descriptor.data_register == 5);
     REQUIRE(descriptor.register_class == pgas_x86_register_class::gpr);
     REQUIRE_FALSE(descriptor.atomic);
-    REQUIRE(descriptor.executable_scalar_mov);
+    REQUIRE(descriptor.replayable);
 }
 
 TEST_CASE("main executable and exact allowlist basenames are instrumented",

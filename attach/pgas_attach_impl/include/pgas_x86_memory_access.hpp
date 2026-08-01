@@ -33,7 +33,7 @@ struct pgas_x86_memory_descriptor {
     int data_register{};
     pgas_x86_register_class register_class{ pgas_x86_register_class::none };
     bool atomic{};
-    bool executable_scalar_mov{};
+    bool replayable{};
 };
 
 struct pgas_x86_segment {

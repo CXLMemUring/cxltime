@@ -16,6 +16,7 @@
 #include "pgas_cxlmemsim_integration.hpp"
 #include "pgas_stalker_module_policy.hpp"
 #include "pgas_x86_memory_access.hpp"
+#include "pgas_x86_replay.hpp"
 #include "pgas_x86_xstate.hpp"
 #include <spdlog/spdlog.h>
 #include <array>
@@ -309,6 +310,12 @@ static bool is_mov_insn(unsigned int insn_id) {
     case X86_INS_MOVUPD: case X86_INS_MOVDQA: case X86_INS_MOVDQU:
     case X86_INS_MOVSD:  case X86_INS_MOVSS:
     case X86_INS_MOVQ:   case X86_INS_MOVD:
+    case X86_INS_VMOVQ: case X86_INS_VMOVAPD: case X86_INS_VMOVAPS:
+    case X86_INS_VMOVD: case X86_INS_VMOVDQA: case X86_INS_VMOVDQA32:
+    case X86_INS_VMOVDQA64: case X86_INS_VMOVDQU: case X86_INS_VMOVDQU8:
+    case X86_INS_VMOVDQU16: case X86_INS_VMOVDQU32:
+    case X86_INS_VMOVDQU64: case X86_INS_VMOVSD: case X86_INS_VMOVSS:
+    case X86_INS_VMOVUPD: case X86_INS_VMOVUPS:
         return true;
     default:
         return false;
@@ -438,15 +445,15 @@ static bool analyze_memory_instruction(
             const auto access = x86->operands[i].access;
             if (is_prefetch_instruction(insn)) {
                 out->access_class = pgas_x86_access_class::prefetch;
+            } else if (is_mov_insn(insn->id)) {
+                out->access_class =
+                    i == 0 ? pgas_x86_access_class::write
+                           : pgas_x86_access_class::read;
             } else if ((access & CS_AC_READ) && (access & CS_AC_WRITE)) {
                 out->access_class = pgas_x86_access_class::read_modify_write;
             } else if (access & CS_AC_READ) {
                 out->access_class = pgas_x86_access_class::read;
             } else if (access & CS_AC_WRITE) {
-                out->access_class = pgas_x86_access_class::write;
-            } else if (i != 0) {
-                out->access_class = pgas_x86_access_class::read;
-            } else if (is_mov_insn(insn->id)) {
                 out->access_class = pgas_x86_access_class::write;
             } else {
                 out->access_class = pgas_x86_access_class::read_modify_write;
@@ -469,15 +476,16 @@ static bool analyze_memory_instruction(
         }
     }
 
-    const bool scalar_width = out->width == 1 || out->width == 2 ||
-                              out->width == 4 || out->width == 8;
-    const bool simple_access =
-        out->access_class == pgas_x86_access_class::read ||
-        out->access_class == pgas_x86_access_class::write;
-    out->executable_scalar_mov =
-        memory_count == 1 && is_mov_insn(insn->id) &&
-        mov_is_enabled(insn->id, cfg) && simple_access && scalar_width &&
-        out->register_class == pgas_x86_register_class::gpr && !out->atomic;
+    const auto base = static_cast<x86_reg>(out->base_register);
+    const auto index = static_cast<x86_reg>(out->index_register);
+    const bool scalar_address =
+        (base == X86_REG_INVALID || base == X86_REG_RIP || is_gpr(base)) &&
+        (index == X86_REG_INVALID || is_gpr(index));
+    const bool configured_mov = !is_mov_insn(insn->id) ||
+                                mov_is_enabled(insn->id, cfg);
+    out->replayable = memory_count == 1 && out->width >= 1 &&
+                      out->width <= 64 && scalar_address && configured_mov &&
+                      out->access_class != pgas_x86_access_class::unsupported;
     return true;
 }
 
@@ -592,8 +600,8 @@ static memory_callout_data *alloc_callout_data() {
 }
 
 struct pending_access {
-    pgas_x86_access_event event{};
-    bool active{};
+    pgas_x86_replay_transaction transaction{};
+    const memory_callout_data *callout{};
 };
 
 static thread_local pending_access current_access;
@@ -678,15 +686,6 @@ static void runtime_failure(void *, const pgas_x86_failure &failure)
     emit_fatal_failure(failure, "none");
 }
 
-static uint64_t read_data_register(const GumCpuContext *cpu, x86_reg reg)
-{
-    uint64_t value = read_reg(cpu, reg);
-    if (reg == X86_REG_AH || reg == X86_REG_BH || reg == X86_REG_CH ||
-        reg == X86_REG_DH)
-        value >>= 8;
-    return value;
-}
-
 static void memory_pre_callout(GumCpuContext *cpu_context, gpointer user_data)
 {
     auto *cd = static_cast<memory_callout_data *>(user_data);
@@ -702,57 +701,61 @@ static void memory_pre_callout(GumCpuContext *cpu_context, gpointer user_data)
         strict_access_failure(cd, effective_address, -EOVERFLOW);
     if (bind_current_thread(cd->context) == nullptr)
         strict_access_failure(cd, effective_address, -ESRCH);
-    if (cd->descriptor.access_class == pgas_x86_access_class::prefetch) {
-        ++current_thread_record->stats.unsupported;
-        return;
-    }
-    if (!cd->descriptor.executable_scalar_mov)
+    if (!cd->descriptor.replayable)
         strict_access_failure(cd, effective_address, -ENOTSUP);
-    if (current_access.active)
+    if (current_access.transaction.active)
         strict_access_failure(cd, effective_address, -EBUSY);
 
-    current_access.event = {};
-    current_access.event.descriptor = &cd->descriptor;
-    current_access.event.effective_address = effective_address;
-
-    int result{};
-    if (cd->descriptor.access_class == pgas_x86_access_class::read) {
-        result = pgas_x86_begin_load(cd->runtime, &current_access.event);
-    } else if (cd->descriptor.access_class == pgas_x86_access_class::write) {
-        const uint64_t value = read_data_register(
-            cpu_context, static_cast<x86_reg>(cd->descriptor.data_register));
-        result = pgas_x86_begin_store(cd->runtime, &current_access.event,
-                                      &value, cd->descriptor.width);
-    } else {
-        strict_access_failure(cd, effective_address, -ENOTSUP);
-    }
+    const pgas_x86_runtime_config plan_config{
+        cd->pgas_base, cd->pgas_size, cd->local_node_id, cd->num_nodes, {},
+        nullptr, nullptr
+    };
+    const auto plan = pgas_x86_plan_contiguous(
+        plan_config, effective_address, cd->descriptor.width);
+    if (plan.status != 0)
+        strict_access_failure(cd, effective_address, plan.status);
+    current_access = {};
+    current_access.callout = cd;
+    const int result = pgas_x86_replay_prepare(
+        cd->runtime, current_access.transaction, plan,
+        cd->descriptor.access_class);
     if (result != 0)
         strict_access_failure(cd, effective_address, result);
 
-    current_access.active = true;
     __atomic_fetch_add(&cd->stats->callouts_fired, 1, __ATOMIC_RELAXED);
-    if (current_access.event.target_node == cd->local_node_id) {
+    size_t remote_bytes{};
+    bool remote{};
+    for (size_t i = 0; i < plan.fragment_count; ++i) {
+        if (plan.fragments[i].remote) {
+            remote = true;
+            remote_bytes += plan.fragments[i].size;
+        }
+    }
+    if (!remote) {
         __atomic_fetch_add(&cd->stats->local_passthrough, 1,
                            __ATOMIC_RELAXED);
     } else if (cd->descriptor.access_class == pgas_x86_access_class::read) {
         __atomic_fetch_add(&cd->stats->remote_loads, 1, __ATOMIC_RELAXED);
         ++current_thread_record->stats.remote_loads;
-        current_thread_record->stats.bytes_read += cd->descriptor.width;
-    } else {
+        current_thread_record->stats.bytes_read += remote_bytes;
+    } else if (cd->descriptor.access_class == pgas_x86_access_class::write) {
         __atomic_fetch_add(&cd->stats->remote_stores, 1, __ATOMIC_RELAXED);
         ++current_thread_record->stats.remote_stores;
-        current_thread_record->stats.bytes_written += cd->descriptor.width;
+        current_thread_record->stats.bytes_written += remote_bytes;
     }
-    if (current_access.event.segments.count > 1)
+    if (plan.lock_count > 1)
         ++current_thread_record->stats.cross_line_splits;
 }
 
-static void memory_post_callout(GumCpuContext *, gpointer)
+static void memory_post_callout(GumCpuContext *, gpointer user_data)
 {
-    if (!current_access.active)
+    if (!current_access.transaction.active)
         return;
-    pgas_x86_finish_access(&current_access.event);
-    current_access.active = false;
+    auto *cd = static_cast<memory_callout_data *>(user_data);
+    const int result = pgas_x86_replay_commit(current_access.transaction);
+    current_access.callout = nullptr;
+    if (result != 0)
+        strict_access_failure(cd, cd->descriptor.instruction_address, result);
 }
 
 static bool choose_scratch_registers(
