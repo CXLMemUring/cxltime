@@ -14,6 +14,7 @@ set(PGAS_ATTACH_SOURCES
     src/pgas_cxlmemsim_integration.cpp
     src/pgas_stalker_module_policy.cpp
     src/pgas_x86_memory_access.cpp
+    src/pgas_x86_xstate.cpp
     ${PGAS_STALKER_SOURCE}
 )
 
@@ -24,6 +25,7 @@ set(PGAS_ATTACH_HEADERS
     include/pgas_stalker_mov.hpp
     include/pgas_stalker_module_policy.hpp
     include/pgas_x86_memory_access.hpp
+    include/pgas_x86_xstate.hpp
 )
 
 # CXLMemSim client library path (from libpgas)
@@ -109,6 +111,22 @@ if(BUILD_TESTING)
 
     add_test(NAME test_pgas_x86_memory_access
         COMMAND test_pgas_x86_memory_access)
+
+    add_executable(test_pgas_x86_xstate
+        test/test_pgas_x86_xstate.cpp
+    )
+
+    target_link_libraries(test_pgas_x86_xstate
+        bpftime_pgas_attach_impl
+        Catch2::Catch2WithMain
+    )
+
+    target_include_directories(test_pgas_x86_xstate PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
+    add_test(NAME test_pgas_x86_xstate
+        COMMAND test_pgas_x86_xstate)
 
     add_executable(test_pgas_stalker_module_policy
         test/test_pgas_stalker_module_policy.cpp
