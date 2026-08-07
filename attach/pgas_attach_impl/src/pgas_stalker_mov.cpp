@@ -165,6 +165,7 @@ struct pgas_stalker_ctx {
     pgas_stalker_config_t config;
     pgas_stalker_stats_t stats;
     pgas_x86_runtime *runtime;
+    bool owns_runtime{};
     pgas_x86_xstate_layout xstate;
     std::unique_ptr<pgas_stalker_module_policy> module_policy;
     std::string main_basename;
@@ -1651,6 +1652,36 @@ static void transform_block(GumStalkerIterator *iterator,
 
 extern "C" {
 
+void pgas_stalker_record_bulk(pgas_bulk_operation_t operation, size_t size)
+{
+    const auto index = static_cast<unsigned>(operation);
+    if (current_thread_record == nullptr || index >= 4)
+        return;
+    ++current_thread_record->stats.bulk_calls[index];
+    current_thread_record->stats.bulk_bytes[index] += size;
+}
+
+void pgas_stalker_fatal_bulk(const char *operation, uint64_t address,
+                             size_t size, uint16_t node, int error)
+{
+    if (current_thread_record != nullptr)
+        ++current_thread_record->stats.failures;
+    pgas_x86_failure failure{};
+    failure.thread_id = static_cast<uint64_t>(syscall(SYS_gettid));
+    std::snprintf(failure.mnemonic, sizeof(failure.mnemonic), "%s",
+                  operation == nullptr ? "bulk" : operation);
+    std::snprintf(failure.module_basename,
+                  sizeof(failure.module_basename), "libc");
+    failure.access_class = pgas_x86_access_class::read_modify_write;
+    failure.phase = pgas_x86_transaction_phase::commit;
+    failure.effective_address = address;
+    failure.width = size;
+    failure.lane_index = UINT8_MAX;
+    failure.target_node = node;
+    failure.transport_error = error;
+    emit_fatal_failure(failure, "none");
+}
+
 pgas_stalker_ctx_t *pgas_stalker_init(const pgas_stalker_config_t *config) {
     if (config == nullptr || config->num_nodes > 64)
         return nullptr;
@@ -1686,16 +1717,20 @@ pgas_stalker_ctx_t *pgas_stalker_init(const pgas_stalker_config_t *config) {
         ctx->config.hook_movnti = true;
     }
 
-    const pgas_x86_runtime_config runtime_config{
-        config->pgas_base_addr,
-        config->pgas_region_size,
-        config->local_node_id,
-        config->num_nodes,
-        pgas_cxlmemsim_x86_transport(),
-        runtime_failure,
-        nullptr,
-    };
-    ctx->runtime = pgas_x86_runtime_create(runtime_config);
+    ctx->runtime = pgas_cxlmemsim_acquire_x86_runtime();
+    if (ctx->runtime == nullptr) {
+        const pgas_x86_runtime_config runtime_config{
+            config->pgas_base_addr,
+            config->pgas_region_size,
+            config->local_node_id,
+            config->num_nodes,
+            pgas_cxlmemsim_x86_transport(),
+            runtime_failure,
+            nullptr,
+        };
+        ctx->runtime = pgas_x86_runtime_create(runtime_config);
+        ctx->owns_runtime = ctx->runtime != nullptr;
+    }
     if (ctx->runtime == nullptr) {
         SPDLOG_ERROR("Invalid x86 PGAS runtime configuration");
         delete ctx;
@@ -1705,7 +1740,10 @@ pgas_stalker_ctx_t *pgas_stalker_init(const pgas_stalker_config_t *config) {
     ctx->stalker = gum_stalker_new();
     if (!ctx->stalker) {
         SPDLOG_ERROR("gum_stalker_new() failed");
-        pgas_x86_runtime_destroy(ctx->runtime);
+        if (ctx->owns_runtime)
+            pgas_x86_runtime_destroy(ctx->runtime);
+        else
+            pgas_cxlmemsim_release_x86_runtime_user(ctx->runtime);
         delete ctx;
         return nullptr;
     }
@@ -2022,6 +2060,17 @@ void append_remote_by_node(std::string &output,
     output.push_back('}');
 }
 
+void append_bulk_values(std::string &output, const uint64_t values[4])
+{
+    output += "{\"memcpy\":" + std::to_string(values[PGAS_BULK_MEMCPY]) +
+              ",\"memmove\":" +
+              std::to_string(values[PGAS_BULK_MEMMOVE]) +
+              ",\"memset\":" +
+              std::to_string(values[PGAS_BULK_MEMSET]) +
+              ",\"rep_string\":" +
+              std::to_string(values[PGAS_BULK_REP_STRING]) + "}";
+}
+
 void write_stdout(const std::string &output)
 {
     size_t offset{};
@@ -2084,6 +2133,11 @@ void pgas_stalker_print_json(
                   ",\"lock_leaks\":" + std::to_string(thread.lock_leaks) +
                   ",\"xstate_failures\":" +
                   std::to_string(thread.xstate_failures) +
+                  ",\"bulk_calls\":";
+        append_bulk_values(output, thread.bulk_calls);
+        output += ",\"bulk_bytes\":";
+        append_bulk_values(output, thread.bulk_bytes);
+        output +=
                   ",\"remote_by_node\":";
         append_remote_by_node(output, thread);
         output +=
@@ -2112,6 +2166,10 @@ void pgas_stalker_print_json(
         totals.lock_contentions += thread.lock_contentions;
         totals.lock_leaks += thread.lock_leaks;
         totals.xstate_failures += thread.xstate_failures;
+        for (size_t operation = 0; operation < 4; ++operation) {
+            totals.bulk_calls[operation] += thread.bulk_calls[operation];
+            totals.bulk_bytes[operation] += thread.bulk_bytes[operation];
+        }
         for (size_t node = 0; node < 64; ++node) {
             totals.remote_requests_by_node[node] +=
                 thread.remote_requests_by_node[node];
@@ -2161,6 +2219,11 @@ void pgas_stalker_print_json(
               ",\"lock_leaks\":" + std::to_string(totals.lock_leaks) +
               ",\"xstate_failures\":" +
               std::to_string(totals.xstate_failures) +
+              ",\"bulk_calls\":";
+    append_bulk_values(output, totals.bulk_calls);
+    output += ",\"bulk_bytes\":";
+    append_bulk_values(output, totals.bulk_bytes);
+    output +=
               ",\"remote_by_node\":";
     append_remote_by_node(output, totals);
     output +=
@@ -2203,7 +2266,10 @@ void pgas_stalker_finalize(pgas_stalker_ctx_t *ctx) {
     if (ctx->transformer)
         g_object_unref(ctx->transformer);
 
-    pgas_x86_runtime_destroy(ctx->runtime);
+    if (ctx->owns_runtime)
+        pgas_x86_runtime_destroy(ctx->runtime);
+    else
+        pgas_cxlmemsim_release_x86_runtime_user(ctx->runtime);
 
     // Reset bump allocator (no individual frees needed)
     g_callout_pool_next = 0;

@@ -83,6 +83,8 @@ typedef struct {
     uint64_t lock_contentions;
     uint64_t lock_leaks;
     uint64_t xstate_failures;
+    uint64_t bulk_calls[4];
+    uint64_t bulk_bytes[4];
     uint64_t remote_requests_by_node[64];
     uint64_t remote_bytes_by_node[64];
     uint64_t unsupported;
@@ -145,6 +147,17 @@ int pgas_stalker_strict_valid(pgas_stalker_ctx_t *ctx);
 int pgas_stalker_sigaction(pgas_stalker_ctx_t *ctx, int signal_number,
                            const struct sigaction *action,
                            struct sigaction *old_action);
+
+typedef enum {
+    PGAS_BULK_MEMCPY = 0,
+    PGAS_BULK_MEMMOVE = 1,
+    PGAS_BULK_MEMSET = 2,
+    PGAS_BULK_REP_STRING = 3,
+} pgas_bulk_operation_t;
+
+void pgas_stalker_record_bulk(pgas_bulk_operation_t operation, size_t size);
+void pgas_stalker_fatal_bulk(const char *operation, uint64_t address,
+                             size_t size, uint16_t node, int error);
 
 // Print statistics
 void pgas_stalker_print_stats(pgas_stalker_ctx_t *ctx);

@@ -9,6 +9,7 @@
 #include "pgas_x86_memory_access.hpp"
 #include "cxlmemsim_client.h"
 #include <memory>
+#include <atomic>
 #include <unordered_map>
 #include <mutex>
 
@@ -127,18 +128,25 @@ public:
 
     // Get configuration
     const config& get_config() const { return config_; }
+    pgas_x86_runtime *acquire_x86_runtime();
+    void release_x86_runtime_user(pgas_x86_runtime *runtime);
+    bool touches_pgas(uint64_t address, size_t size) const;
+    void release_x86_runtime();
 
     // Print statistics
     void print_stats() const;
 
 private:
     pgas_cxlmemsim_hooker() = default;
-    ~pgas_cxlmemsim_hooker() { remove_hooks(); }
+    ~pgas_cxlmemsim_hooker() { remove_hooks(); release_x86_runtime(); }
 
     config config_;
     std::unique_ptr<pgas_attach_impl> attach_impl_;
     bool initialized_ = false;
     bool hooks_installed_ = false;
+    pgas_x86_runtime *x86_runtime_ = nullptr;
+    std::atomic<uint64_t> x86_runtime_users_{};
+    std::atomic<bool> x86_runtime_accepting_{};
 };
 
 // Override callback that routes to CXLMemSim
@@ -178,6 +186,8 @@ void finalize();
 } // namespace hooks
 
 pgas_x86_transport pgas_cxlmemsim_x86_transport();
+pgas_x86_runtime *pgas_cxlmemsim_acquire_x86_runtime();
+void pgas_cxlmemsim_release_x86_runtime_user(pgas_x86_runtime *runtime);
 
 } // namespace attach
 } // namespace bpftime

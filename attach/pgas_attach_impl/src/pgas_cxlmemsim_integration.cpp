@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cctype>
 #include <limits>
+#include <thread>
 
 namespace bpftime {
 namespace attach {
@@ -146,6 +147,24 @@ int pgas_cxlmemsim_hooker::init(const config& cfg) {
     // Set PGAS region
     attach_impl_->set_pgas_region(cfg.pgas_base_addr, cfg.pgas_region_size);
 
+    release_x86_runtime();
+    const pgas_x86_runtime_config runtime_config{
+        cfg.pgas_base_addr,
+        cfg.pgas_region_size,
+        cfg.local_node_id,
+        cfg.num_nodes,
+        pgas_cxlmemsim_x86_transport(),
+        nullptr,
+        nullptr,
+    };
+    x86_runtime_ = pgas_x86_runtime_create(runtime_config);
+    if (x86_runtime_ == nullptr) {
+        SPDLOG_ERROR("Invalid shared x86 PGAS runtime configuration");
+        attach_impl_.reset();
+        return -EINVAL;
+    }
+    x86_runtime_accepting_.store(true, std::memory_order_release);
+
     initialized_ = true;
     SPDLOG_INFO("PGAS CXLMemSim hooker initialized: "
                 "local_node={} num_nodes={} pgas_base=0x{:x} pgas_size={}",
@@ -153,6 +172,51 @@ int pgas_cxlmemsim_hooker::init(const config& cfg) {
                 cfg.pgas_base_addr, cfg.pgas_region_size);
 
     return 0;
+}
+
+bool pgas_cxlmemsim_hooker::touches_pgas(uint64_t address, size_t size) const
+{
+    uint64_t region_end{};
+    if (__builtin_add_overflow(config_.pgas_base_addr,
+                               config_.pgas_region_size, &region_end))
+        return false;
+    if (size == 0)
+        return address >= config_.pgas_base_addr && address < region_end;
+    uint64_t access_end{};
+    if (__builtin_add_overflow(address, static_cast<uint64_t>(size),
+                               &access_end))
+        return true;
+    return address < region_end && access_end > config_.pgas_base_addr;
+}
+
+void pgas_cxlmemsim_hooker::release_x86_runtime()
+{
+    x86_runtime_accepting_.store(false, std::memory_order_release);
+    while (x86_runtime_users_.load(std::memory_order_acquire) != 0)
+        std::this_thread::yield();
+    if (x86_runtime_ != nullptr) {
+        pgas_x86_runtime_destroy(x86_runtime_);
+        x86_runtime_ = nullptr;
+    }
+}
+
+pgas_x86_runtime *pgas_cxlmemsim_hooker::acquire_x86_runtime()
+{
+    if (!x86_runtime_accepting_.load(std::memory_order_acquire))
+        return nullptr;
+    x86_runtime_users_.fetch_add(1, std::memory_order_acq_rel);
+    if (!x86_runtime_accepting_.load(std::memory_order_acquire)) {
+        x86_runtime_users_.fetch_sub(1, std::memory_order_acq_rel);
+        return nullptr;
+    }
+    return x86_runtime_;
+}
+
+void pgas_cxlmemsim_hooker::release_x86_runtime_user(
+    pgas_x86_runtime *runtime)
+{
+    if (runtime != nullptr)
+        x86_runtime_users_.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 int pgas_cxlmemsim_hooker::install_hooks() {
@@ -524,6 +588,7 @@ cxlmemsim_connection_manager::stats get_stats() {
 
 void finalize() {
     stop();
+    pgas_cxlmemsim_hooker::instance().release_x86_runtime();
     cxlmemsim_connection_manager::instance().shutdown();
 }
 
@@ -550,6 +615,16 @@ int x86_transport_write(void *, uint16_t node, uint64_t address,
 pgas_x86_transport pgas_cxlmemsim_x86_transport()
 {
     return { x86_transport_read, x86_transport_write, nullptr };
+}
+
+pgas_x86_runtime *pgas_cxlmemsim_acquire_x86_runtime()
+{
+    return pgas_cxlmemsim_hooker::instance().acquire_x86_runtime();
+}
+
+void pgas_cxlmemsim_release_x86_runtime_user(pgas_x86_runtime *runtime)
+{
+    pgas_cxlmemsim_hooker::instance().release_x86_runtime_user(runtime);
 }
 
 } // namespace attach

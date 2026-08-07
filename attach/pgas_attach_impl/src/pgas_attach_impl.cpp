@@ -2,6 +2,8 @@
 // PGAS Attach Implementation using Frida
 #include "pgas_attach_impl.hpp"
 #include "pgas_cxlmemsim_integration.hpp"
+#include "pgas_stalker_mov.hpp"
+#include "pgas_x86_bulk.hpp"
 #include "frida_register_def.hpp"
 #include <spdlog/spdlog.h>
 #include <cstring>
@@ -13,6 +15,7 @@ namespace attach {
 // Thread-local storage for current context
 static thread_local GumCpuContext *current_gum_context = nullptr;
 static thread_local pgas_internal_attach_entry *current_pgas_entry = nullptr;
+static thread_local bool bulk_interceptor_active;
 
 // Forward declarations for Frida callbacks
 static void pgas_listener_on_enter(GumInvocationListener *listener,
@@ -268,26 +271,31 @@ extern "C" void *pgas_memcpy_override_handler() {
     size_t n = (size_t)gum_invocation_context_get_nth_argument(ctx, 2);
 #endif
 
+    if (bulk_interceptor_active && entry->orig_function) {
+        auto real_fn =
+            (void *(*)(void *, const void *, size_t))entry->orig_function;
+        return real_fn(dest, src, n);
+    }
+
     // Execute callbacks
     entry->execute_memcpy_callbacks(dest, src, n);
 
-    // Check if dest or src falls in the PGAS region -> route through CXLMemSim
-    uint16_t dest_node = entry->route_to_node((uint64_t)dest);
-    uint16_t src_node = entry->route_to_node((uint64_t)src);
-
-    if (dest_node != entry->local_node_id) {
-        // Destination is remote: write local src data to remote dest
-        SPDLOG_DEBUG("PGAS remote memcpy (store): dest={} src={} size={} target_node={}",
-                     dest, src, n, dest_node);
-        pgas_remote_memcpy_handler(dest, src, n, dest_node, /*dest_is_remote=*/true);
-        return dest;
-    }
-
-    if (src_node != entry->local_node_id) {
-        // Source is remote: read from remote src into local dest
-        SPDLOG_DEBUG("PGAS remote memcpy (load): dest={} src={} size={} target_node={}",
-                     dest, src, n, src_node);
-        pgas_remote_memcpy_handler(dest, src, n, src_node, /*dest_is_remote=*/false);
+    auto &hooker = pgas_cxlmemsim_hooker::instance();
+    if (hooker.touches_pgas((uint64_t)dest, n) ||
+        hooker.touches_pgas((uint64_t)src, n)) {
+        bulk_interceptor_active = true;
+        auto *runtime = pgas_cxlmemsim_acquire_x86_runtime();
+        const int result = pgas_x86_bulk_copy(runtime, dest, src, n);
+        pgas_cxlmemsim_release_x86_runtime_user(runtime);
+        bulk_interceptor_active = false;
+        if (result != 0) {
+            const uint64_t address = hooker.touches_pgas((uint64_t)dest, n)
+                                         ? (uint64_t)dest
+                                         : (uint64_t)src;
+            pgas_stalker_fatal_bulk("memcpy", address, n,
+                                    hooker.addr_to_node(address), result);
+        }
+        pgas_stalker_record_bulk(PGAS_BULK_MEMCPY, n);
         return dest;
     }
 
@@ -324,6 +332,12 @@ extern "C" void *pgas_memmove_override_handler() {
     size_t n = (size_t)gum_invocation_context_get_nth_argument(ctx, 2);
 #endif
 
+    if (bulk_interceptor_active && entry->orig_function) {
+        auto real_fn =
+            (void *(*)(void *, const void *, size_t))entry->orig_function;
+        return real_fn(dest, src, n);
+    }
+
     // Execute callbacks
     pgas_memory_context mem_ctx;
     mem_ctx.address = dest;
@@ -340,18 +354,23 @@ extern "C" void *pgas_memmove_override_handler() {
         }
     }
 
-    // Route remote accesses through CXLMemSim
-    if (mem_ctx.is_remote) {
-        uint16_t dest_node = entry->route_to_node((uint64_t)dest);
-        uint16_t src_node = entry->route_to_node((uint64_t)src);
-        if (dest_node != entry->local_node_id) {
-            pgas_remote_memcpy_handler(dest, src, n, dest_node, true);
-            return dest;
+    auto &hooker = pgas_cxlmemsim_hooker::instance();
+    if (hooker.touches_pgas((uint64_t)dest, n) ||
+        hooker.touches_pgas((uint64_t)src, n)) {
+        bulk_interceptor_active = true;
+        auto *runtime = pgas_cxlmemsim_acquire_x86_runtime();
+        const int result = pgas_x86_bulk_move(runtime, dest, src, n);
+        pgas_cxlmemsim_release_x86_runtime_user(runtime);
+        bulk_interceptor_active = false;
+        if (result != 0) {
+            const uint64_t address = hooker.touches_pgas((uint64_t)dest, n)
+                                         ? (uint64_t)dest
+                                         : (uint64_t)src;
+            pgas_stalker_fatal_bulk("memmove", address, n,
+                                    hooker.addr_to_node(address), result);
         }
-        if (src_node != entry->local_node_id) {
-            pgas_remote_memcpy_handler(dest, src, n, src_node, false);
-            return dest;
-        }
+        pgas_stalker_record_bulk(PGAS_BULK_MEMMOVE, n);
+        return dest;
     }
 
     // Both local - call the REAL original via Frida's saved pointer
@@ -389,6 +408,11 @@ extern "C" void *pgas_memset_override_handler() {
     size_t n = (size_t)gum_invocation_context_get_nth_argument(ctx, 2);
 #endif
 
+    if (bulk_interceptor_active && entry->orig_function) {
+        auto real_fn = (void *(*)(void *, int, size_t))entry->orig_function;
+        return real_fn(s, c, n);
+    }
+
     // Execute callbacks
     pgas_memory_context mem_ctx;
     mem_ctx.address = s;
@@ -405,9 +429,18 @@ extern "C" void *pgas_memset_override_handler() {
         }
     }
 
-    // Route remote memset through CXLMemSim
-    if (mem_ctx.is_remote) {
-        pgas_remote_memset_handler(s, c, n, mem_ctx.target_node);
+    auto &hooker = pgas_cxlmemsim_hooker::instance();
+    if (hooker.touches_pgas((uint64_t)s, n)) {
+        bulk_interceptor_active = true;
+        auto *runtime = pgas_cxlmemsim_acquire_x86_runtime();
+        const int result =
+            pgas_x86_bulk_set(runtime, s, (unsigned char)c, n);
+        pgas_cxlmemsim_release_x86_runtime_user(runtime);
+        bulk_interceptor_active = false;
+        if (result != 0)
+            pgas_stalker_fatal_bulk("memset", (uint64_t)s, n,
+                                    hooker.addr_to_node((uint64_t)s), result);
+        pgas_stalker_record_bulk(PGAS_BULK_MEMSET, n);
         return s;
     }
 
