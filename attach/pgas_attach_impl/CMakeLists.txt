@@ -13,6 +13,7 @@ set(PGAS_ATTACH_SOURCES
     src/pgas_attach_impl.cpp
     src/pgas_cxlmemsim_integration.cpp
     src/pgas_stalker_module_policy.cpp
+    src/pgas_x86_bulk.cpp
     src/pgas_x86_memory_access.cpp
     src/pgas_x86_replay.cpp
     src/pgas_x86_xstate.cpp
@@ -25,6 +26,7 @@ set(PGAS_ATTACH_HEADERS
     include/pgas_cxlmemsim_integration.hpp
     include/pgas_stalker_mov.hpp
     include/pgas_stalker_module_policy.hpp
+    include/pgas_x86_bulk.hpp
     include/pgas_x86_memory_access.hpp
     include/pgas_x86_replay.hpp
     include/pgas_x86_xstate.hpp
@@ -149,6 +151,22 @@ if(BUILD_TESTING)
 
     add_test(NAME test_pgas_x86_replay
         COMMAND test_pgas_x86_replay)
+
+    add_executable(test_pgas_x86_bulk
+        test/test_pgas_x86_bulk.cpp
+    )
+
+    target_link_libraries(test_pgas_x86_bulk
+        bpftime_pgas_attach_impl
+        Catch2::Catch2WithMain
+    )
+
+    target_include_directories(test_pgas_x86_bulk PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
+    add_test(NAME test_pgas_x86_bulk
+        COMMAND test_pgas_x86_bulk)
 
     add_executable(test_pgas_stalker_module_policy
         test/test_pgas_stalker_module_policy.cpp
