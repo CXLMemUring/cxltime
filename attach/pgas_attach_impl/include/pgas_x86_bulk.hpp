@@ -3,6 +3,7 @@
 
 #include "pgas_x86_memory_access.hpp"
 
+#include <cstddef>
 #include <cstdint>
 
 namespace bpftime::attach {
@@ -37,5 +38,12 @@ pgas_x86_bulk_plan pgas_x86_plan_bulk(pgas_x86_bulk_kind kind,
 bool pgas_x86_bulk_next(const pgas_x86_runtime_config &config,
                         const pgas_x86_bulk_plan &plan, uint64_t completed,
                         pgas_x86_bulk_chunk &chunk);
+
+int pgas_x86_bulk_copy(pgas_x86_runtime *runtime, void *destination,
+                       const void *source, size_t size);
+int pgas_x86_bulk_move(pgas_x86_runtime *runtime, void *destination,
+                       const void *source, size_t size);
+int pgas_x86_bulk_set(pgas_x86_runtime *runtime, void *destination,
+                      unsigned char value, size_t size);
 
 } // namespace bpftime::attach

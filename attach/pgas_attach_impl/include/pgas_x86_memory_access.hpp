@@ -126,6 +126,8 @@ pgas_x86_segments pgas_x86_split_cachelines(uint64_t address, size_t width);
 pgas_x86_runtime *
 pgas_x86_runtime_create(const pgas_x86_runtime_config &config);
 void pgas_x86_runtime_destroy(pgas_x86_runtime *runtime);
+int pgas_x86_runtime_get_config(const pgas_x86_runtime *runtime,
+                                pgas_x86_runtime_config &config);
 
 int pgas_x86_begin_load(pgas_x86_runtime *runtime,
                         pgas_x86_access_event *event);

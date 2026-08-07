@@ -2,7 +2,10 @@
 #include "pgas_x86_bulk.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cerrno>
+#include <cstring>
 #include <limits>
 
 namespace bpftime::attach {
@@ -14,6 +17,13 @@ struct endpoint_classification {
     bool remote{};
     uint64_t boundary_distance{};
 };
+
+constexpr size_t cache_line_size = 64;
+constexpr size_t maximum_bulk_chunk = 64 * 1024;
+constexpr size_t maximum_bulk_lines =
+    2 * (maximum_bulk_chunk / cache_line_size + 1);
+
+thread_local std::array<std::byte, maximum_bulk_chunk> bulk_staging;
 
 bool config_bounds(const pgas_x86_runtime_config &config, uint64_t &end,
                    uint64_t &node_size)
@@ -80,6 +90,129 @@ endpoint_classification classify_backward(
     result.remote = result.node != config.local_node_id;
     result.boundary_distance = cursor_end - node_base;
     return result;
+}
+
+bool address_in_pgas(const pgas_x86_runtime_config &config, uint64_t address)
+{
+    uint64_t end{};
+    return !__builtin_add_overflow(config.pgas_base, config.pgas_size, &end) &&
+           address >= config.pgas_base && address < end;
+}
+
+bool append_lines(const pgas_x86_runtime_config &config, uint64_t address,
+                  size_t size,
+                  std::array<uint64_t, maximum_bulk_lines> &lines,
+                  size_t &line_count)
+{
+    if (size == 0 || !address_in_pgas(config, address))
+        return true;
+    uint64_t last{};
+    if (__builtin_add_overflow(address, static_cast<uint64_t>(size - 1),
+                               &last))
+        return false;
+    uint64_t line = address & ~(uint64_t(cache_line_size) - 1);
+    const uint64_t last_line = last & ~(uint64_t(cache_line_size) - 1);
+    while (true) {
+        if (line_count == lines.size())
+            return false;
+        lines[line_count++] = line;
+        if (line == last_line)
+            return true;
+        line += cache_line_size;
+    }
+}
+
+class bulk_lock_guard {
+  public:
+    explicit bulk_lock_guard(pgas_x86_runtime *runtime) : runtime_(runtime) {}
+    bulk_lock_guard(const bulk_lock_guard &) = delete;
+    bulk_lock_guard &operator=(const bulk_lock_guard &) = delete;
+    ~bulk_lock_guard()
+    {
+        if (acquired_ != 0)
+            pgas_x86_runtime_unlock_lines(runtime_, stripes_.data(),
+                                          acquired_);
+    }
+
+    int acquire(const pgas_x86_runtime_config &config,
+                const pgas_x86_bulk_chunk &chunk,
+                pgas_x86_bulk_kind kind)
+    {
+        std::array<uint64_t, maximum_bulk_lines> lines{};
+        size_t line_count = 0;
+        if (!append_lines(config, chunk.destination, chunk.size, lines,
+                          line_count) ||
+            (kind != pgas_x86_bulk_kind::set &&
+             !append_lines(config, chunk.source, chunk.size, lines,
+                           line_count)))
+            return -E2BIG;
+        return pgas_x86_runtime_lock_lines(
+            runtime_, lines.data(), line_count, stripes_.data(),
+            stripes_.size(), acquired_);
+    }
+
+  private:
+    pgas_x86_runtime *runtime_{};
+    std::array<uint16_t, maximum_bulk_lines> stripes_{};
+    uint16_t acquired_{};
+};
+
+int execute_bulk(pgas_x86_runtime *runtime, pgas_x86_bulk_kind kind,
+                 void *destination, const void *source, unsigned char value,
+                 size_t size)
+{
+    if (size == 0)
+        return 0;
+    if (runtime == nullptr || destination == nullptr ||
+        (kind != pgas_x86_bulk_kind::set && source == nullptr))
+        return -EINVAL;
+
+    pgas_x86_runtime_config config{};
+    int result = pgas_x86_runtime_get_config(runtime, config);
+    if (result != 0)
+        return result;
+    const auto plan = pgas_x86_plan_bulk(
+        kind, reinterpret_cast<uint64_t>(destination),
+        reinterpret_cast<uint64_t>(source), size);
+    if (plan.status != 0)
+        return plan.status;
+
+    uint64_t completed = 0;
+    pgas_x86_bulk_chunk chunk{};
+    while (pgas_x86_bulk_next(config, plan, completed, chunk)) {
+        bulk_lock_guard locks(runtime);
+        result = locks.acquire(config, chunk, kind);
+        if (result != 0)
+            return result;
+
+        auto *staging = bulk_staging.data();
+        if (kind == pgas_x86_bulk_kind::set) {
+            std::memset(staging, value, chunk.size);
+        } else if (chunk.source_remote) {
+            result = pgas_x86_runtime_read(runtime, chunk.source_node,
+                                           chunk.source, staging, chunk.size);
+            if (result != 0)
+                return result;
+            std::memcpy(reinterpret_cast<void *>(chunk.source), staging,
+                        chunk.size);
+        } else {
+            std::memcpy(staging,
+                        reinterpret_cast<const void *>(chunk.source),
+                        chunk.size);
+        }
+
+        std::memcpy(reinterpret_cast<void *>(chunk.destination), staging,
+                    chunk.size);
+        if (chunk.destination_remote) {
+            result = pgas_x86_runtime_write(
+                runtime, chunk.destination_node, chunk.destination, staging,
+                chunk.size);
+            if (result != 0)
+                return result;
+        }
+        completed += chunk.size;
+    }
+    return completed == size ? 0 : -ERANGE;
 }
 
 } // namespace
@@ -180,6 +313,27 @@ bool pgas_x86_bulk_next(const pgas_x86_runtime_config &config,
     chunk.destination_remote = destination_class.remote;
     chunk.source_remote = source_class.remote;
     return true;
+}
+
+int pgas_x86_bulk_copy(pgas_x86_runtime *runtime, void *destination,
+                       const void *source, size_t size)
+{
+    return execute_bulk(runtime, pgas_x86_bulk_kind::copy, destination, source,
+                        0, size);
+}
+
+int pgas_x86_bulk_move(pgas_x86_runtime *runtime, void *destination,
+                       const void *source, size_t size)
+{
+    return execute_bulk(runtime, pgas_x86_bulk_kind::move, destination, source,
+                        0, size);
+}
+
+int pgas_x86_bulk_set(pgas_x86_runtime *runtime, void *destination,
+                      unsigned char value, size_t size)
+{
+    return execute_bulk(runtime, pgas_x86_bulk_kind::set, destination, nullptr,
+                        value, size);
 }
 
 } // namespace bpftime::attach

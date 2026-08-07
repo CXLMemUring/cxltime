@@ -3,7 +3,14 @@
 
 #include "pgas_x86_bulk.hpp"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <cstring>
 #include <cstdint>
+#include <thread>
 #include <vector>
 
 using namespace bpftime::attach;
@@ -38,6 +45,78 @@ collect(const pgas_x86_runtime_config &runtime_config,
     }
     REQUIRE(completed == plan.total_size);
     return chunks;
+}
+
+} // namespace
+
+namespace {
+
+struct bulk_transport_state {
+    std::array<std::vector<uint8_t>, 3> nodes;
+    int fail_read{};
+    int fail_write{};
+    std::atomic<int> active_writes{};
+    std::atomic<int> maximum_active_writes{};
+    bool delay_writes{};
+
+    bulk_transport_state()
+    {
+        for (auto &node : nodes)
+            node.resize(node_size);
+    }
+};
+
+int bulk_read(void *opaque, uint16_t node, uint64_t offset,
+              void *destination, size_t size)
+{
+    auto &state = *static_cast<bulk_transport_state *>(opaque);
+    if (state.fail_read != 0)
+        return state.fail_read;
+    if (node >= state.nodes.size() || offset + size > state.nodes[node].size())
+        return -ERANGE;
+    std::memcpy(destination, state.nodes[node].data() + offset, size);
+    return 0;
+}
+
+int bulk_write(void *opaque, uint16_t node, uint64_t offset,
+               const void *source, size_t size)
+{
+    auto &state = *static_cast<bulk_transport_state *>(opaque);
+    if (state.fail_write != 0)
+        return state.fail_write;
+    const int active = state.active_writes.fetch_add(1) + 1;
+    int maximum = state.maximum_active_writes.load();
+    while (active > maximum &&
+           !state.maximum_active_writes.compare_exchange_weak(maximum,
+                                                               active)) {
+    }
+    if (state.delay_writes)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (node >= state.nodes.size() || offset + size > state.nodes[node].size()) {
+        state.active_writes.fetch_sub(1);
+        return -ERANGE;
+    }
+    std::memcpy(state.nodes[node].data() + offset, source, size);
+    state.active_writes.fetch_sub(1);
+    return 0;
+}
+
+pgas_x86_runtime *make_bulk_runtime(std::vector<uint8_t> &shadow,
+                                    bulk_transport_state &transport)
+{
+    pgas_x86_runtime_config runtime_config{};
+    runtime_config.pgas_base = reinterpret_cast<uint64_t>(shadow.data());
+    runtime_config.pgas_size = shadow.size();
+    runtime_config.local_node_id = 0;
+    runtime_config.num_nodes = 3;
+    runtime_config.transport = { bulk_read, bulk_write, &transport };
+    return pgas_x86_runtime_create(runtime_config);
+}
+
+void fill_pattern(uint8_t *destination, size_t size, uint8_t seed)
+{
+    for (size_t index = 0; index < size; ++index)
+        destination[index] = static_cast<uint8_t>(seed + index * 17);
 }
 
 } // namespace
@@ -146,4 +225,159 @@ TEST_CASE("bulk chunks are bounded to sixty-four KiB",
     for (const auto &chunk : chunks)
         total += chunk.size;
     CHECK(total == size);
+}
+
+TEST_CASE("bulk execution preserves every local and remote copy combination",
+          "[pgas][x86][bulk][execute]")
+{
+    std::vector<uint8_t> shadow(3 * node_size, 0x55);
+    bulk_transport_state transport;
+    auto *runtime = make_bulk_runtime(shadow, transport);
+    REQUIRE(runtime != nullptr);
+    auto *remote1 = shadow.data() + node_size;
+    auto *remote2 = shadow.data() + 2 * node_size;
+    std::array<uint8_t, 256> local_source{};
+    std::array<uint8_t, 256> local_destination{};
+    fill_pattern(local_source.data(), local_source.size(), 3);
+
+    REQUIRE(pgas_x86_bulk_copy(runtime, remote1 + 128, local_source.data(),
+                               local_source.size()) == 0);
+    CHECK(std::memcmp(remote1 + 128, local_source.data(),
+                      local_source.size()) == 0);
+    CHECK(std::memcmp(transport.nodes[1].data() + 128, local_source.data(),
+                      local_source.size()) == 0);
+
+    fill_pattern(transport.nodes[1].data() + 1024,
+                 local_destination.size(), 29);
+    REQUIRE(pgas_x86_bulk_copy(runtime, local_destination.data(),
+                               remote1 + 1024,
+                               local_destination.size()) == 0);
+    CHECK(std::memcmp(local_destination.data(),
+                      transport.nodes[1].data() + 1024,
+                      local_destination.size()) == 0);
+    CHECK(std::memcmp(remote1 + 1024, local_destination.data(),
+                      local_destination.size()) == 0);
+
+    fill_pattern(transport.nodes[1].data() + 2048, 256, 47);
+    REQUIRE(pgas_x86_bulk_copy(runtime, remote1 + 4096, remote1 + 2048,
+                               256) == 0);
+    CHECK(std::memcmp(transport.nodes[1].data() + 4096,
+                      transport.nodes[1].data() + 2048, 256) == 0);
+
+    REQUIRE(pgas_x86_bulk_copy(runtime, remote2 + 8192, remote1 + 2048,
+                               256) == 0);
+    CHECK(std::memcmp(transport.nodes[2].data() + 8192,
+                      transport.nodes[1].data() + 2048, 256) == 0);
+    CHECK(std::memcmp(remote2 + 8192,
+                      transport.nodes[2].data() + 8192, 256) == 0);
+
+    std::vector<uint8_t> large_source(node_size);
+    fill_pattern(large_source.data(), large_source.size(), 151);
+    REQUIRE(pgas_x86_bulk_copy(runtime, remote1, large_source.data(),
+                               large_source.size()) == 0);
+    CHECK(std::memcmp(transport.nodes[1].data(), large_source.data(),
+                      large_source.size()) == 0);
+
+    REQUIRE(pgas_x86_bulk_set(runtime, remote2 + 16384, 0x6c, 4096) == 0);
+    CHECK(std::all_of(transport.nodes[2].begin() + 16384,
+                      transport.nodes[2].begin() + 16384 + 4096,
+                      [](uint8_t value) { return value == 0x6c; }));
+
+    pgas_x86_runtime_destroy(runtime);
+}
+
+TEST_CASE("bulk move honors forward and backward remote overlap",
+          "[pgas][x86][bulk][execute]")
+{
+    std::vector<uint8_t> shadow(3 * node_size, 0);
+    bulk_transport_state transport;
+    auto *runtime = make_bulk_runtime(shadow, transport);
+    REQUIRE(runtime != nullptr);
+    auto *remote = shadow.data() + node_size;
+
+    for (const bool backward : { false, true }) {
+        fill_pattern(transport.nodes[1].data() + 512, 1024,
+                     backward ? 71 : 93);
+        std::memset(remote + 512, 0xa5, 1024);
+        auto expected = transport.nodes[1];
+        const size_t destination = backward ? 640 : 512;
+        const size_t source = backward ? 512 : 640;
+        std::memmove(expected.data() + destination,
+                     expected.data() + source, 768);
+
+        REQUIRE(pgas_x86_bulk_move(runtime, remote + destination,
+                                   remote + source, 768) == 0);
+        CHECK(transport.nodes[1] == expected);
+        CHECK(std::memcmp(remote + destination,
+                          expected.data() + destination, 768) == 0);
+    }
+
+    pgas_x86_runtime_destroy(runtime);
+}
+
+TEST_CASE("bulk execution splits nodes and reports transport failures",
+          "[pgas][x86][bulk][execute][failure]")
+{
+    std::vector<uint8_t> shadow(3 * node_size, 0);
+    bulk_transport_state transport;
+    auto *runtime = make_bulk_runtime(shadow, transport);
+    REQUIRE(runtime != nullptr);
+    std::array<uint8_t, 128> source{};
+    fill_pattern(source.data(), source.size(), 117);
+    auto *crossing = shadow.data() + 2 * node_size - 32;
+
+    REQUIRE(pgas_x86_bulk_copy(runtime, crossing, source.data(),
+                               source.size()) == 0);
+    CHECK(std::memcmp(transport.nodes[1].data() + node_size - 32,
+                      source.data(), 32) == 0);
+    CHECK(std::memcmp(transport.nodes[2].data(), source.data() + 32,
+                      source.size() - 32) == 0);
+
+    transport.fail_read = -EMSGSIZE;
+    CHECK(pgas_x86_bulk_copy(runtime, source.data(),
+                             shadow.data() + node_size, 64) == -EMSGSIZE);
+    transport.fail_read = 0;
+    transport.fail_write = -EIO;
+    CHECK(pgas_x86_bulk_set(runtime, shadow.data() + node_size, 0x6c, 64) ==
+          -EIO);
+
+    pgas_x86_runtime_destroy(runtime);
+}
+
+TEST_CASE("bulk operations serialize threads touching the same remote line",
+          "[pgas][x86][bulk][execute][thread]")
+{
+    std::vector<uint8_t> shadow(3 * node_size, 0);
+    bulk_transport_state transport;
+    transport.delay_writes = true;
+    auto *runtime = make_bulk_runtime(shadow, transport);
+    REQUIRE(runtime != nullptr);
+    std::array<uint8_t, 64> first{};
+    std::array<uint8_t, 64> second{};
+    first.fill(0x11);
+    second.fill(0x22);
+    auto *remote = shadow.data() + node_size + 256;
+    std::atomic<int> first_status{ -1 };
+    std::atomic<int> second_status{ -1 };
+
+    std::thread a([&] {
+        first_status = pgas_x86_bulk_copy(runtime, remote, first.data(),
+                                          first.size());
+    });
+    std::thread b([&] {
+        second_status = pgas_x86_bulk_copy(runtime, remote, second.data(),
+                                           second.size());
+    });
+    a.join();
+    b.join();
+
+    CHECK(first_status == 0);
+    CHECK(second_status == 0);
+    CHECK(transport.maximum_active_writes == 1);
+    const bool is_first =
+        std::memcmp(transport.nodes[1].data() + 256, first.data(), 64) == 0;
+    const bool is_second =
+        std::memcmp(transport.nodes[1].data() + 256, second.data(), 64) == 0;
+    CHECK((is_first || is_second));
+    pgas_x86_runtime_destroy(runtime);
 }

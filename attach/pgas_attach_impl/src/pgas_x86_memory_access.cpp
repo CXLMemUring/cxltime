@@ -228,6 +228,15 @@ void pgas_x86_runtime_destroy(pgas_x86_runtime *runtime)
     delete runtime;
 }
 
+int pgas_x86_runtime_get_config(const pgas_x86_runtime *runtime,
+                                pgas_x86_runtime_config &config)
+{
+    if (runtime == nullptr)
+        return -EINVAL;
+    config = runtime->config;
+    return 0;
+}
+
 int pgas_x86_begin_load(pgas_x86_runtime *runtime,
                         pgas_x86_access_event *event)
 {
