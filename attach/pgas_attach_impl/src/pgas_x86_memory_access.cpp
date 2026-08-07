@@ -107,9 +107,16 @@ int report_failure(pgas_x86_runtime *runtime, pgas_x86_access_event *event,
     failure.instruction_id = descriptor.instruction_id;
     std::memcpy(failure.mnemonic, descriptor.mnemonic,
                 sizeof(failure.mnemonic));
+    failure.instruction_size = descriptor.instruction_size;
+    failure.instruction_bytes = descriptor.instruction_bytes;
+    std::memcpy(failure.module_basename, descriptor.module_basename,
+                sizeof(failure.module_basename));
     failure.access_class = descriptor.access_class;
+    failure.phase = pgas_x86_transaction_phase::prepare;
     failure.effective_address = event->effective_address;
     failure.width = descriptor.width;
+    failure.operand_index = descriptor.memory_operand_index;
+    failure.lane_index = UINT8_MAX;
     failure.segment_index = segment_index;
     failure.target_node = event->target_node;
     failure.transport_error = error;
@@ -290,9 +297,11 @@ void pgas_x86_finish_access(pgas_x86_access_event *event)
 int pgas_x86_runtime_lock_lines(pgas_x86_runtime *runtime,
                                 const uint64_t *lines, size_t line_count,
                                 uint16_t *stripes, size_t stripe_capacity,
-                                uint16_t &acquired)
+                                uint16_t &acquired, uint64_t *contentions)
 {
     acquired = 0;
+    if (contentions != nullptr)
+        *contentions = 0;
     if (runtime == nullptr || (line_count != 0 && lines == nullptr) ||
         (line_count != 0 && stripes == nullptr) ||
         line_count > stripe_capacity || line_count > lock_stripe_count)
@@ -307,9 +316,14 @@ int pgas_x86_runtime_lock_lines(pgas_x86_runtime *runtime,
     const auto *unique_end = std::unique(stripes, stripes + line_count);
     const size_t unique_count = unique_end - stripes;
     for (size_t i = 0; i < unique_count; ++i) {
+        bool contended = false;
         while (runtime->line_locks[stripes[i]].test_and_set(
-            std::memory_order_acquire))
+            std::memory_order_acquire)) {
+            contended = true;
             std::this_thread::yield();
+        }
+        if (contended && contentions != nullptr)
+            ++*contentions;
         ++acquired;
     }
     return 0;

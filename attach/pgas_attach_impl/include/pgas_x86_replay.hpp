@@ -29,6 +29,7 @@ struct pgas_x86_replay_fragment {
     uint8_t size{};
     uint16_t node{};
     uint64_t line{};
+    uint8_t lane{ UINT8_MAX };
     bool remote{};
 };
 
@@ -42,6 +43,10 @@ struct pgas_x86_replay_plan {
     uint16_t active_lanes{};
     uint16_t fragment_count{};
     uint16_t lock_count{};
+    uint64_t failure_address{};
+    uint16_t failure_node{ UINT16_MAX };
+    uint16_t failure_fragment{ UINT16_MAX };
+    uint8_t failure_lane{ UINT8_MAX };
     int status{};
 };
 
@@ -52,6 +57,11 @@ struct pgas_x86_replay_transaction {
     std::array<std::byte, pgas_x86_max_replay_bytes> staging{};
     std::array<uint16_t, pgas_x86_max_replay_fragments> lock_stripes{};
     uint16_t acquired_locks{};
+    uint64_t lock_contentions{};
+    uint64_t failure_address{};
+    uint16_t failure_node{ UINT16_MAX };
+    uint16_t failure_fragment{ UINT16_MAX };
+    uint8_t failure_lane{ UINT8_MAX };
     int status{};
     bool active{};
     bool failed{};

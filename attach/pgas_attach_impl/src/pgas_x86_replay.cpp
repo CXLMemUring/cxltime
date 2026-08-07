@@ -31,12 +31,17 @@ int append_lane(pgas_x86_replay_plan &plan,
                 uint64_t node_size, size_t lane_index, uint64_t address,
                 uint8_t width, uint16_t operand_offset)
 {
+    const auto fail = [&](int error) {
+        plan.failure_address = address;
+        plan.failure_lane = static_cast<uint8_t>(lane_index);
+        return error;
+    };
     const auto range = pgas_x86_classify_range(
         address, width, config.pgas_base, config.pgas_size);
     if (range == pgas_x86_range_result::overflow)
-        return -EOVERFLOW;
+        return fail(-EOVERFLOW);
     if (range != pgas_x86_range_result::inside)
-        return -ERANGE;
+        return fail(-ERANGE);
 
     auto &lane = plan.lanes[lane_index];
     lane.address = address;
@@ -50,11 +55,11 @@ int append_lane(pgas_x86_replay_plan &plan,
     uint64_t access_end{};
     if (__builtin_add_overflow(address, static_cast<uint64_t>(width),
                                &access_end))
-        return -EOVERFLOW;
+        return fail(-EOVERFLOW);
 
     while (cursor < access_end) {
         if (plan.fragment_count >= plan.fragments.size())
-            return -E2BIG;
+            return fail(-E2BIG);
 
         const uint64_t region_offset = cursor - config.pgas_base;
         uint64_t node = region_offset / node_size;
@@ -69,7 +74,7 @@ int append_lane(pgas_x86_replay_plan &plan,
         const uint64_t fragment_end =
             std::min({ access_end, node_end, line_end });
         if (fragment_end <= cursor)
-            return -EOVERFLOW;
+            return fail(-EOVERFLOW);
 
         auto &fragment = plan.fragments[plan.fragment_count++];
         fragment.address = cursor;
@@ -78,6 +83,7 @@ int append_lane(pgas_x86_replay_plan &plan,
         fragment.size = static_cast<uint8_t>(fragment_end - cursor);
         fragment.node = static_cast<uint16_t>(node);
         fragment.line = line;
+        fragment.lane = static_cast<uint8_t>(lane_index);
         fragment.remote = node != config.local_node_id;
         lane.remote = lane.remote || fragment.remote;
         plan.lock_lines[plan.lock_count++] = line;
@@ -192,13 +198,18 @@ int pgas_x86_replay_prepare(pgas_x86_runtime *runtime,
     transaction.access = access;
     transaction.runtime = runtime;
     transaction.acquired_locks = 0;
+    transaction.lock_contentions = 0;
+    transaction.failure_address = 0;
+    transaction.failure_node = UINT16_MAX;
+    transaction.failure_fragment = UINT16_MAX;
+    transaction.failure_lane = UINT8_MAX;
     transaction.status = 0;
     transaction.failed = false;
 
     int result = pgas_x86_runtime_lock_lines(
         runtime, plan.lock_lines.data(), plan.lock_count,
         transaction.lock_stripes.data(), transaction.lock_stripes.size(),
-        transaction.acquired_locks);
+        transaction.acquired_locks, &transaction.lock_contentions);
     if (result != 0) {
         transaction.status = result;
         transaction.failed = true;
@@ -216,6 +227,10 @@ int pgas_x86_replay_prepare(pgas_x86_runtime *runtime,
             static_cast<size_t>(fragment.byte_offset) + fragment.size;
         if (staging_end > transaction.staging.size()) {
             result = -E2BIG;
+            transaction.failure_address = fragment.address;
+            transaction.failure_node = fragment.node;
+            transaction.failure_fragment = static_cast<uint16_t>(i);
+            transaction.failure_lane = fragment.lane;
             break;
         }
         if (!fragment.remote)
@@ -224,8 +239,13 @@ int pgas_x86_replay_prepare(pgas_x86_runtime *runtime,
             runtime, fragment.node, fragment.address,
             transaction.staging.data() + fragment.byte_offset,
             fragment.size);
-        if (result != 0)
+        if (result != 0) {
+            transaction.failure_address = fragment.address;
+            transaction.failure_node = fragment.node;
+            transaction.failure_fragment = static_cast<uint16_t>(i);
+            transaction.failure_lane = fragment.lane;
             break;
+        }
     }
 
     if (result == 0) {
@@ -265,6 +285,10 @@ int pgas_x86_replay_commit(pgas_x86_replay_transaction &transaction)
             if (result != 0) {
                 transaction.status = result;
                 transaction.failed = true;
+                transaction.failure_address = fragment.address;
+                transaction.failure_node = fragment.node;
+                transaction.failure_fragment = static_cast<uint16_t>(i);
+                transaction.failure_lane = fragment.lane;
                 return result;
             }
         }

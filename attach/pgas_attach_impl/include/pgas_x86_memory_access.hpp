@@ -19,10 +19,21 @@ enum class pgas_x86_access_class {
 
 enum class pgas_x86_register_class { none, gpr, xmm, ymm, zmm };
 
+enum class pgas_x86_transaction_phase {
+    plan,
+    prepare,
+    execute,
+    commit,
+    cleanup
+};
+
 struct pgas_x86_memory_descriptor {
     uint64_t instruction_address{};
     unsigned instruction_id{};
     char mnemonic[32]{};
+    uint8_t instruction_size{};
+    std::array<uint8_t, 15> instruction_bytes{};
+    char module_basename[128]{};
     pgas_x86_access_class access_class{ pgas_x86_access_class::unsupported };
     uint8_t memory_operand_index{};
     uint8_t width{};
@@ -68,9 +79,15 @@ struct pgas_x86_failure {
     uint64_t instruction_address{};
     unsigned instruction_id{};
     char mnemonic[32]{};
+    uint8_t instruction_size{};
+    std::array<uint8_t, 15> instruction_bytes{};
+    char module_basename[128]{};
     pgas_x86_access_class access_class{ pgas_x86_access_class::unsupported };
+    pgas_x86_transaction_phase phase{ pgas_x86_transaction_phase::plan };
     uint64_t effective_address{};
     size_t width{};
+    uint8_t operand_index{};
+    uint8_t lane_index{ UINT8_MAX };
     uint8_t segment_index{};
     uint16_t target_node{};
     int transport_error{};
@@ -121,7 +138,8 @@ void pgas_x86_finish_access(pgas_x86_access_event *event);
 int pgas_x86_runtime_lock_lines(pgas_x86_runtime *runtime,
                                 const uint64_t *lines, size_t line_count,
                                 uint16_t *stripes, size_t stripe_capacity,
-                                uint16_t &acquired);
+                                uint16_t &acquired,
+                                uint64_t *contentions = nullptr);
 void pgas_x86_runtime_unlock_lines(pgas_x86_runtime *runtime,
                                    const uint16_t *stripes,
                                    uint16_t acquired);

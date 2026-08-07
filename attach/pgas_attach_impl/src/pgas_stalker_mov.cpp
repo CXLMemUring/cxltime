@@ -151,6 +151,13 @@ struct stalker_thread_record {
     pgas_stalker_thread_stats_t stats{};
 };
 
+struct application_signal_state {
+    std::array<struct sigaction, 2> actions{};
+    std::array<std::atomic<unsigned>, 2> readers{};
+    std::atomic<uint64_t> published{};
+    std::atomic<uint64_t> reset_claimed{ UINT64_MAX };
+};
+
 struct pgas_stalker_ctx {
     GumStalker *stalker;
     GumStalkerTransformer *transformer;
@@ -167,6 +174,10 @@ struct pgas_stalker_ctx {
     std::mutex lifecycle_mutex;
     std::vector<std::unique_ptr<stalker_thread_record>> threads;
     uint64_t next_runtime_id;
+    uint64_t followed_threads{};
+    std::array<application_signal_state, 4> application_signals{};
+    std::atomic_flag signal_action_writer = ATOMIC_FLAG_INIT;
+    std::atomic<bool> signal_handlers_installed{};
 
     std::atomic<bool> active;
 };
@@ -381,22 +392,32 @@ static pgas_x86_register_class register_class(x86_reg reg)
     return pgas_x86_register_class::none;
 }
 
-static bool is_atomic_instruction(const cs_insn *insn)
+static bool has_lock_prefix(const cs_insn *insn)
 {
     const auto &x86 = insn->detail->x86;
-    if (x86.prefix[0] == X86_PREFIX_LOCK || x86.prefix[1] == X86_PREFIX_LOCK ||
-        x86.prefix[2] == X86_PREFIX_LOCK || x86.prefix[3] == X86_PREFIX_LOCK)
-        return true;
+    return x86.prefix[0] == X86_PREFIX_LOCK ||
+           x86.prefix[1] == X86_PREFIX_LOCK ||
+           x86.prefix[2] == X86_PREFIX_LOCK ||
+           x86.prefix[3] == X86_PREFIX_LOCK;
+}
+
+static bool is_explicit_rmw_instruction(const cs_insn *insn)
+{
     switch (insn->id) {
-    case X86_INS_XCHG:
     case X86_INS_CMPXCHG:
     case X86_INS_CMPXCHG8B:
     case X86_INS_CMPXCHG16B:
     case X86_INS_XADD:
+    case X86_INS_XCHG:
         return true;
     default:
         return false;
     }
+}
+
+static bool is_atomic_instruction(const cs_insn *insn)
+{
+    return has_lock_prefix(insn) || insn->id == X86_INS_XCHG;
 }
 
 static bool is_prefetch_instruction(const cs_insn *insn)
@@ -453,6 +474,17 @@ static bool analyze_memory_instruction(
     out->instruction_address = insn->address;
     out->instruction_id = insn->id;
     snprintf(out->mnemonic, sizeof(out->mnemonic), "%s", insn->mnemonic);
+    out->instruction_size = static_cast<uint8_t>(
+        std::min<size_t>(insn->size, out->instruction_bytes.size()));
+    std::memcpy(out->instruction_bytes.data(), insn->bytes,
+                out->instruction_size);
+    Dl_info module_info{};
+    if (dladdr(reinterpret_cast<const void *>(insn->address),
+               &module_info) != 0) {
+        const auto module = basename_from_path(module_info.dli_fname);
+        snprintf(out->module_basename, sizeof(out->module_basename), "%s",
+                 module.c_str());
+    }
     out->atomic = is_atomic_instruction(insn);
     out->gather = is_gather_instruction(insn);
     out->scatter = is_scatter_instruction(insn);
@@ -497,6 +529,8 @@ static bool analyze_memory_instruction(
         return false;
     if (memory_count != 1)
         out->access_class = pgas_x86_access_class::unsupported;
+    else if (out->atomic || is_explicit_rmw_instruction(insn))
+        out->access_class = pgas_x86_access_class::read_modify_write;
 
     for (uint8_t i = 0; i < x86->op_count; ++i) {
         if (i == out->memory_operand_index)
@@ -790,9 +824,274 @@ static memory_callout_data *alloc_callout_data() {
 struct pending_access {
     pgas_x86_replay_transaction transaction{};
     const memory_callout_data *callout{};
+    uint64_t effective_address{};
 };
 
 static thread_local pending_access current_access;
+static thread_local std::atomic<bool> current_access_signal_active{};
+
+static_assert(std::atomic<bool>::is_always_lock_free);
+static_assert(std::atomic<unsigned>::is_always_lock_free);
+static_assert(std::atomic<pgas_stalker_ctx *>::is_always_lock_free);
+static_assert(__atomic_always_lock_free(sizeof(uint64_t), nullptr));
+
+namespace {
+
+constexpr std::array<int, 4> replay_fault_signals{
+    SIGSEGV, SIGBUS, SIGILL, SIGFPE,
+};
+
+std::atomic<pgas_stalker_ctx *> replay_signal_context{};
+
+using real_sigaction_fn = int (*)(int, const struct sigaction *,
+                                  struct sigaction *);
+
+real_sigaction_fn resolve_real_sigaction()
+{
+    static const auto implementation = reinterpret_cast<real_sigaction_fn>(
+        dlsym(RTLD_NEXT, "sigaction"));
+    return implementation;
+}
+
+int call_real_sigaction(int signal_number, const struct sigaction *action,
+                        struct sigaction *old_action)
+{
+    const auto implementation = resolve_real_sigaction();
+    if (implementation == nullptr) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return implementation(signal_number, action, old_action);
+}
+
+size_t replay_signal_index(int signal_number)
+{
+    for (size_t index = 0; index < replay_fault_signals.size(); ++index) {
+        if (replay_fault_signals[index] == signal_number)
+            return index;
+    }
+    return replay_fault_signals.size();
+}
+
+struct application_action_snapshot {
+    struct sigaction action{};
+    uint64_t publication{};
+};
+
+application_action_snapshot load_application_action(
+    application_signal_state &state)
+{
+    for (;;) {
+        const uint64_t publication = state.published.load(
+            std::memory_order_acquire);
+        const unsigned slot = static_cast<unsigned>(publication & 1U);
+        state.readers[slot].fetch_add(1, std::memory_order_acquire);
+        if (state.published.load(std::memory_order_acquire) == publication) {
+            application_action_snapshot snapshot{
+                state.actions[slot], publication
+            };
+            state.readers[slot].fetch_sub(1, std::memory_order_release);
+            return snapshot;
+        }
+        state.readers[slot].fetch_sub(1, std::memory_order_release);
+    }
+}
+
+void block_all_signals(sigset_t &old_mask)
+{
+    sigset_t all_signals;
+    sigfillset(&all_signals);
+    sigprocmask(SIG_SETMASK, &all_signals, &old_mask);
+}
+
+void restore_signal_mask(const sigset_t &old_mask)
+{
+    sigprocmask(SIG_SETMASK, &old_mask, nullptr);
+}
+
+void lock_signal_action_writer(pgas_stalker_ctx *ctx)
+{
+    while (ctx->signal_action_writer.test_and_set(std::memory_order_acquire)) {
+    }
+}
+
+void unlock_signal_action_writer(pgas_stalker_ctx *ctx)
+{
+    ctx->signal_action_writer.clear(std::memory_order_release);
+}
+
+void publish_application_action(application_signal_state &state,
+                                const struct sigaction &action,
+                                uint64_t current_publication)
+{
+    const uint64_t next_publication = current_publication + 1;
+    const unsigned next_slot =
+        static_cast<unsigned>(next_publication & 1U);
+    while (state.readers[next_slot].load(std::memory_order_acquire) != 0) {
+    }
+    state.actions[next_slot] = action;
+    state.published.store(next_publication, std::memory_order_release);
+}
+
+[[noreturn]] void restore_default_and_raise(int signal_number)
+{
+    struct sigaction action{};
+    action.sa_handler = SIG_DFL;
+    sigemptyset(&action.sa_mask);
+    call_real_sigaction(signal_number, &action, nullptr);
+    sigset_t signal_set;
+    sigemptyset(&signal_set);
+    sigaddset(&signal_set, signal_number);
+    sigprocmask(SIG_UNBLOCK, &signal_set, nullptr);
+    raise(signal_number);
+    _exit(128 + signal_number);
+}
+
+void chain_replay_signal(const struct sigaction &saved, int signal_number,
+                         siginfo_t *info, void *ucontext)
+{
+    if (saved.sa_handler == SIG_IGN)
+        return;
+    if (saved.sa_handler == SIG_DFL)
+        restore_default_and_raise(signal_number);
+
+    if ((saved.sa_flags & SA_SIGINFO) != 0)
+        saved.sa_sigaction(signal_number, info, ucontext);
+    else
+        saved.sa_handler(signal_number);
+}
+
+void replay_signal_handler(int signal_number, siginfo_t *info, void *ucontext)
+{
+    auto *ctx = replay_signal_context.load(std::memory_order_acquire);
+    const size_t signal_index = replay_signal_index(signal_number);
+    if (ctx == nullptr || signal_index == replay_fault_signals.size())
+        restore_default_and_raise(signal_number);
+
+    if (current_thread_context == ctx && current_thread_record != nullptr &&
+        current_access_signal_active.exchange(false,
+                                              std::memory_order_acq_rel)) {
+        pgas_x86_replay_abort(current_access.transaction);
+        current_access.callout = nullptr;
+        __atomic_fetch_add(
+            &current_thread_record->stats.transaction_aborts, UINT64_C(1),
+            __ATOMIC_RELAXED);
+        __atomic_fetch_add(
+            &current_thread_record->stats.signal_cleanups, UINT64_C(1),
+            __ATOMIC_RELAXED);
+        const uint64_t active = __atomic_load_n(
+            &current_thread_record->stats.active_transactions,
+            __ATOMIC_RELAXED);
+        if (active != 0) {
+            __atomic_fetch_sub(
+                &current_thread_record->stats.active_transactions,
+                UINT64_C(1), __ATOMIC_RELAXED);
+        }
+    }
+
+    auto &state = ctx->application_signals[signal_index];
+    const auto snapshot = load_application_action(state);
+    const struct sigaction &saved = snapshot.action;
+    if ((saved.sa_flags & SA_RESETHAND) != 0 &&
+        state.reset_claimed.exchange(snapshot.publication,
+                                     std::memory_order_acq_rel) ==
+            snapshot.publication) {
+        struct sigaction default_action{};
+        default_action.sa_handler = SIG_DFL;
+        sigemptyset(&default_action.sa_mask);
+        chain_replay_signal(default_action, signal_number, info, ucontext);
+    }
+    chain_replay_signal(saved, signal_number, info, ucontext);
+}
+
+struct sigaction replay_wrapper_action(const struct sigaction &application)
+{
+    struct sigaction wrapper{};
+    wrapper.sa_sigaction = replay_signal_handler;
+    wrapper.sa_mask = application.sa_mask;
+    wrapper.sa_flags = SA_SIGINFO |
+        (application.sa_flags & (SA_ONSTACK | SA_NODEFER | SA_RESTART));
+    return wrapper;
+}
+
+bool install_replay_signal_handlers(pgas_stalker_ctx *ctx)
+{
+    if (ctx->signal_handlers_installed.load(std::memory_order_acquire))
+        return true;
+
+    pgas_stalker_ctx *expected = nullptr;
+    if (!replay_signal_context.compare_exchange_strong(
+            expected, ctx, std::memory_order_acq_rel) && expected != ctx)
+        return false;
+
+    sigset_t old_mask;
+    block_all_signals(old_mask);
+    lock_signal_action_writer(ctx);
+    size_t installed{};
+    for (; installed < replay_fault_signals.size(); ++installed) {
+        const int signal_number = replay_fault_signals[installed];
+        struct sigaction application{};
+        if (call_real_sigaction(signal_number, nullptr, &application) != 0)
+            break;
+        auto &state = ctx->application_signals[installed];
+        state.actions[0] = application;
+        state.published.store(0, std::memory_order_relaxed);
+        state.reset_claimed.store(UINT64_MAX, std::memory_order_relaxed);
+        const struct sigaction wrapper = replay_wrapper_action(application);
+        if (call_real_sigaction(signal_number, &wrapper, nullptr) != 0)
+            break;
+    }
+    if (installed == replay_fault_signals.size()) {
+        ctx->signal_handlers_installed.store(true, std::memory_order_release);
+        unlock_signal_action_writer(ctx);
+        restore_signal_mask(old_mask);
+        return true;
+    }
+
+    while (installed != 0) {
+        --installed;
+        const auto snapshot = load_application_action(
+            ctx->application_signals[installed]);
+        call_real_sigaction(
+            replay_fault_signals[installed],
+            &snapshot.action, nullptr);
+    }
+    unlock_signal_action_writer(ctx);
+    restore_signal_mask(old_mask);
+    replay_signal_context.store(nullptr, std::memory_order_release);
+    return false;
+}
+
+void restore_replay_signal_handlers(pgas_stalker_ctx *ctx)
+{
+    if (!ctx->signal_handlers_installed.load(std::memory_order_acquire))
+        return;
+    sigset_t old_mask;
+    block_all_signals(old_mask);
+    lock_signal_action_writer(ctx);
+    ctx->signal_handlers_installed.store(false, std::memory_order_release);
+    for (size_t index = 0; index < replay_fault_signals.size(); ++index) {
+        auto &state = ctx->application_signals[index];
+        const auto snapshot = load_application_action(state);
+        struct sigaction application = snapshot.action;
+        if ((application.sa_flags & SA_RESETHAND) != 0 &&
+            state.reset_claimed.load(std::memory_order_acquire) ==
+                snapshot.publication) {
+            application = {};
+            application.sa_handler = SIG_DFL;
+            sigemptyset(&application.sa_mask);
+        }
+        call_real_sigaction(replay_fault_signals[index], &application,
+                            nullptr);
+    }
+    pgas_stalker_ctx *expected = ctx;
+    replay_signal_context.compare_exchange_strong(
+        expected, nullptr, std::memory_order_acq_rel);
+    unlock_signal_action_writer(ctx);
+    restore_signal_mask(old_mask);
+}
+
+} // namespace
 
 static const char *access_class_name(pgas_x86_access_class access_class)
 {
@@ -809,6 +1108,18 @@ static const char *access_class_name(pgas_x86_access_class access_class)
         return "unsupported";
     }
     return "unsupported";
+}
+
+static const char *transaction_phase_name(pgas_x86_transaction_phase phase)
+{
+    switch (phase) {
+    case pgas_x86_transaction_phase::plan: return "plan";
+    case pgas_x86_transaction_phase::prepare: return "prepare";
+    case pgas_x86_transaction_phase::execute: return "execute";
+    case pgas_x86_transaction_phase::commit: return "commit";
+    case pgas_x86_transaction_phase::cleanup: return "cleanup";
+    }
+    return "plan";
 }
 
 static uint16_t target_node_for(const memory_callout_data *cd,
@@ -828,20 +1139,52 @@ static uint16_t target_node_for(const memory_callout_data *cd,
 [[noreturn]] static void emit_fatal_failure(
     const pgas_x86_failure &failure, const char *unsupported)
 {
+    char instruction_bytes[31]{};
+    constexpr char hex[] = "0123456789abcdef";
+    const size_t instruction_size = std::min<size_t>(
+        failure.instruction_size, failure.instruction_bytes.size());
+    for (size_t i = 0; i < instruction_size; ++i) {
+        instruction_bytes[2 * i] = hex[failure.instruction_bytes[i] >> 4];
+        instruction_bytes[2 * i + 1] =
+            hex[failure.instruction_bytes[i] & 0xf];
+    }
     dprintf(STDERR_FILENO,
             "PGAS_X86_FAILURE thread_id=%lu pc=0x%lx mnemonic=%s(%u) "
+            "instruction_bytes=%s module=%s phase=%s operand=%u lane=%u "
             "ea=0x%lx width=%zu access_class=%s segment=%u node=%u "
-            "transport_error=%d unsupported=%s\n",
+            "transport_error=%d transport_status=%d unsupported=%s\n",
             failure.thread_id, failure.instruction_address,
             failure.mnemonic, failure.instruction_id,
+            instruction_bytes, failure.module_basename,
+            transaction_phase_name(failure.phase), failure.operand_index,
+            failure.lane_index,
             failure.effective_address, failure.width,
             access_class_name(failure.access_class), failure.segment_index,
-            failure.target_node, failure.transport_error, unsupported);
+            failure.target_node, failure.transport_error,
+            failure.transport_error, unsupported);
+    dprintf(STDOUT_FILENO,
+            "{\"kind\":\"pgas_x86_failure\",\"thread_id\":%lu,"
+            "\"pc\":%lu,\"mnemonic\":\"%s\",\"instruction_id\":%u,"
+            "\"instruction_bytes\":\"%s\",\"module\":\"%s\","
+            "\"phase\":\"%s\",\"operand\":%u,\"lane\":%u,"
+            "\"segment\":%u,\"effective_address\":%lu,\"width\":%zu,"
+            "\"node\":%u,"
+            "\"transport_status\":%d}\n",
+            failure.thread_id, failure.instruction_address,
+            failure.mnemonic, failure.instruction_id, instruction_bytes,
+            failure.module_basename, transaction_phase_name(failure.phase),
+            failure.operand_index, failure.lane_index,
+            failure.segment_index,
+            failure.effective_address, failure.width, failure.target_node,
+            failure.transport_error);
     _exit(128 + SIGBUS);
 }
 
 [[noreturn]] static void strict_access_failure(
-    const memory_callout_data *cd, uint64_t effective_address, int error)
+    const memory_callout_data *cd, uint64_t effective_address, int error,
+    pgas_x86_transaction_phase phase = pgas_x86_transaction_phase::plan,
+    uint8_t lane_index = UINT8_MAX,
+    uint16_t segment_index = UINT16_MAX)
 {
     const auto &descriptor = cd->descriptor;
     if (current_thread_record != nullptr &&
@@ -857,10 +1200,20 @@ static uint16_t target_node_for(const memory_callout_data *cd,
     failure.instruction_id = descriptor.instruction_id;
     std::memcpy(failure.mnemonic, descriptor.mnemonic,
                 sizeof(failure.mnemonic));
+    failure.instruction_size = descriptor.instruction_size;
+    failure.instruction_bytes = descriptor.instruction_bytes;
+    std::memcpy(failure.module_basename, descriptor.module_basename,
+                sizeof(failure.module_basename));
     failure.access_class = descriptor.access_class;
+    failure.phase = phase;
     failure.effective_address = effective_address;
-    failure.width = descriptor.width;
-    failure.segment_index = UINT8_MAX;
+    failure.width = lane_index != UINT8_MAX && descriptor.lane_width != 0
+                        ? descriptor.lane_width
+                        : descriptor.width;
+    failure.operand_index = descriptor.memory_operand_index;
+    failure.lane_index = lane_index;
+    failure.segment_index = static_cast<uint8_t>(
+        std::min<uint16_t>(segment_index, UINT8_MAX));
     failure.target_node = target_node_for(cd, effective_address);
     failure.transport_error = error;
     emit_fatal_failure(failure,
@@ -893,6 +1246,9 @@ static void memory_pre_callout(GumCpuContext *cpu_context, gpointer user_data)
         strict_access_failure(cd, effective_address, -ENOTSUP);
     if (current_access.transaction.active)
         strict_access_failure(cd, effective_address, -EBUSY);
+    if (cd->descriptor.instruction_id == X86_INS_CMPXCHG16B &&
+        (effective_address & 0xf) != 0)
+        strict_access_failure(cd, effective_address, -EINVAL);
 
     const pgas_x86_runtime_config plan_config{
         cd->pgas_base, cd->pgas_size, cd->local_node_id, cd->num_nodes, {},
@@ -901,21 +1257,70 @@ static void memory_pre_callout(GumCpuContext *cpu_context, gpointer user_data)
     pgas_x86_replay_plan plan{};
     if (cd->descriptor.gather || cd->descriptor.scatter) {
         const int lane_result = plan_vector_lanes(cpu_context, cd, plan);
-        if (lane_result != 0)
-            strict_access_failure(cd, effective_address, lane_result);
+        if (lane_result != 0) {
+            if (plan.status == 0)
+                ++current_thread_record->stats.xstate_failures;
+            strict_access_failure(
+                cd,
+                plan.failure_lane == UINT8_MAX ? effective_address
+                                                : plan.failure_address,
+                lane_result, pgas_x86_transaction_phase::plan,
+                plan.failure_lane, plan.failure_fragment);
+        }
     } else {
         plan = pgas_x86_plan_contiguous(
             plan_config, effective_address, cd->descriptor.width);
     }
     if (plan.status != 0)
-        strict_access_failure(cd, effective_address, plan.status);
+        strict_access_failure(
+            cd,
+            plan.failure_lane == UINT8_MAX ? effective_address
+                                            : plan.failure_address,
+            plan.status, pgas_x86_transaction_phase::plan,
+            plan.failure_lane, plan.failure_fragment);
     current_access = {};
     current_access.callout = cd;
+    current_access.effective_address = effective_address;
     const int result = pgas_x86_replay_prepare(
         cd->runtime, current_access.transaction, plan,
         cd->descriptor.access_class);
-    if (result != 0)
-        strict_access_failure(cd, effective_address, result);
+    if (result != 0) {
+        const auto &transaction = current_access.transaction;
+        strict_access_failure(
+            cd,
+            transaction.failure_lane == UINT8_MAX
+                ? effective_address
+                : transaction.failure_address,
+            result, pgas_x86_transaction_phase::prepare,
+            transaction.failure_lane, transaction.failure_fragment);
+    }
+    current_access_signal_active.store(true, std::memory_order_release);
+    __atomic_fetch_add(&current_thread_record->stats.active_transactions,
+                       UINT64_C(1), __ATOMIC_RELAXED);
+    current_thread_record->stats.lock_contentions +=
+        current_access.transaction.lock_contentions;
+
+    if (cd->descriptor.register_class == pgas_x86_register_class::xmm ||
+        cd->descriptor.register_class == pgas_x86_register_class::ymm ||
+        cd->descriptor.register_class == pgas_x86_register_class::zmm ||
+        cd->descriptor.gather || cd->descriptor.scatter)
+        ++current_thread_record->stats.vector;
+    if (cd->descriptor.gather)
+        ++current_thread_record->stats.gather;
+    if (cd->descriptor.scatter)
+        ++current_thread_record->stats.scatter;
+    if (cd->descriptor.access_class ==
+        pgas_x86_access_class::read_modify_write)
+        ++current_thread_record->stats.rmw;
+    if (cd->descriptor.atomic)
+        ++current_thread_record->stats.atomic;
+    if (cd->descriptor.access_class == pgas_x86_access_class::prefetch)
+        ++current_thread_record->stats.prefetches;
+    if (cd->descriptor.gather || cd->descriptor.scatter) {
+        current_thread_record->stats.active_lanes += plan.active_lanes;
+        current_thread_record->stats.inactive_lanes +=
+            plan.lane_count - plan.active_lanes;
+    }
 
     __atomic_fetch_add(&cd->stats->callouts_fired, 1, __ATOMIC_RELAXED);
     size_t remote_bytes{};
@@ -929,14 +1334,27 @@ static void memory_pre_callout(GumCpuContext *cpu_context, gpointer user_data)
     if (!remote) {
         __atomic_fetch_add(&cd->stats->local_passthrough, 1,
                            __ATOMIC_RELAXED);
-    } else if (cd->descriptor.access_class == pgas_x86_access_class::read) {
+    } else if (cd->descriptor.access_class == pgas_x86_access_class::read ||
+               cd->descriptor.access_class ==
+                   pgas_x86_access_class::read_modify_write) {
         __atomic_fetch_add(&cd->stats->remote_loads, 1, __ATOMIC_RELAXED);
         ++current_thread_record->stats.remote_loads;
         current_thread_record->stats.bytes_read += remote_bytes;
-    } else if (cd->descriptor.access_class == pgas_x86_access_class::write) {
-        __atomic_fetch_add(&cd->stats->remote_stores, 1, __ATOMIC_RELAXED);
-        ++current_thread_record->stats.remote_stores;
-        current_thread_record->stats.bytes_written += remote_bytes;
+    }
+    const bool issues_read =
+        cd->descriptor.access_class == pgas_x86_access_class::read ||
+        cd->descriptor.access_class == pgas_x86_access_class::read_modify_write ||
+        cd->descriptor.access_class == pgas_x86_access_class::prefetch;
+    if (issues_read) {
+        for (size_t i = 0; i < plan.fragment_count; ++i) {
+            const auto &fragment = plan.fragments[i];
+            if (!fragment.remote || fragment.node >= 64)
+                continue;
+            ++current_thread_record->stats
+                  .remote_requests_by_node[fragment.node];
+            current_thread_record->stats.remote_bytes_by_node[fragment.node] +=
+                fragment.size;
+        }
     }
     if (plan.lock_count > 1)
         ++current_thread_record->stats.cross_line_splits;
@@ -947,10 +1365,53 @@ static void memory_post_callout(GumCpuContext *, gpointer user_data)
     if (!current_access.transaction.active)
         return;
     auto *cd = static_cast<memory_callout_data *>(user_data);
+    const auto access = current_access.transaction.access;
+    const auto plan = current_access.transaction.plan;
+    const uint64_t effective_address = current_access.effective_address;
     const int result = pgas_x86_replay_commit(current_access.transaction);
+    current_access_signal_active.store(false, std::memory_order_release);
     current_access.callout = nullptr;
-    if (result != 0)
-        strict_access_failure(cd, cd->descriptor.instruction_address, result);
+    if (result != 0) {
+        const auto &transaction = current_access.transaction;
+        strict_access_failure(
+            cd,
+            transaction.failure_lane == UINT8_MAX
+                ? effective_address
+                : transaction.failure_address,
+            result, pgas_x86_transaction_phase::commit,
+            transaction.failure_lane, transaction.failure_fragment);
+    }
+    if (access == pgas_x86_access_class::write ||
+        access == pgas_x86_access_class::read_modify_write) {
+        size_t remote_bytes{};
+        for (size_t i = 0; i < plan.fragment_count; ++i) {
+            const auto &fragment = plan.fragments[i];
+            if (!fragment.remote)
+                continue;
+            remote_bytes += fragment.size;
+            if (fragment.node < 64) {
+                ++current_thread_record->stats
+                      .remote_requests_by_node[fragment.node];
+                current_thread_record->stats
+                    .remote_bytes_by_node[fragment.node] += fragment.size;
+            }
+        }
+        if (remote_bytes != 0) {
+            __atomic_fetch_add(&cd->stats->remote_stores, 1,
+                               __ATOMIC_RELAXED);
+            ++current_thread_record->stats.remote_stores;
+            current_thread_record->stats.bytes_written += remote_bytes;
+        }
+    }
+    const uint64_t active = __atomic_load_n(
+        &current_thread_record->stats.active_transactions, __ATOMIC_RELAXED);
+    if (active == 0) {
+        __atomic_fetch_add(&current_thread_record->stats.lock_leaks,
+                           UINT64_C(1), __ATOMIC_RELAXED);
+    } else {
+        __atomic_fetch_sub(&current_thread_record->stats.active_transactions,
+                           UINT64_C(1), __ATOMIC_RELAXED);
+    }
 }
 
 static bool choose_scratch_registers(
@@ -1191,13 +1652,14 @@ static void transform_block(GumStalkerIterator *iterator,
 extern "C" {
 
 pgas_stalker_ctx_t *pgas_stalker_init(const pgas_stalker_config_t *config) {
-    if (config == nullptr)
+    if (config == nullptr || config->num_nodes > 64)
         return nullptr;
     auto *ctx = new pgas_stalker_ctx();
     memset(&ctx->stats, 0, sizeof(ctx->stats));
     ctx->config = *config;
     ctx->runtime = nullptr;
     ctx->next_runtime_id = 1;
+    ctx->followed_threads = 0;
     ctx->active = false;
 
     if (pgas_x86_detect_xstate(ctx->xstate) != 0 ||
@@ -1268,6 +1730,12 @@ int pgas_stalker_follow_me(pgas_stalker_ctx_t *ctx) {
     std::lock_guard lifecycle_lock(ctx->lifecycle_mutex);
     register_current_thread(ctx);
     gum_stalker_follow_me(ctx->stalker, ctx->transformer, NULL);
+    if (!install_replay_signal_handlers(ctx)) {
+        gum_stalker_unfollow_me(ctx->stalker);
+        unregister_current_thread(ctx);
+        return -1;
+    }
+    ++ctx->followed_threads;
     ctx->active = true;
     SPDLOG_INFO("Stalker following current thread");
     return 0;
@@ -1278,6 +1746,12 @@ int pgas_stalker_follow(pgas_stalker_ctx_t *ctx, GumThreadId thread_id) {
     std::lock_guard lifecycle_lock(ctx->lifecycle_mutex);
     create_thread_record(ctx, static_cast<uint64_t>(thread_id));
     gum_stalker_follow(ctx->stalker, thread_id, ctx->transformer, NULL);
+    if (!install_replay_signal_handlers(ctx)) {
+        gum_stalker_unfollow(ctx->stalker, thread_id);
+        unregister_thread_id(ctx, static_cast<uint64_t>(thread_id));
+        return -1;
+    }
+    ++ctx->followed_threads;
     ctx->active = true;
     SPDLOG_INFO("Stalker following thread {}", thread_id);
     return 0;
@@ -1288,6 +1762,12 @@ void pgas_stalker_unfollow_me(pgas_stalker_ctx_t *ctx) {
     std::lock_guard lifecycle_lock(ctx->lifecycle_mutex);
     gum_stalker_unfollow_me(ctx->stalker);
     unregister_current_thread(ctx);
+    if (ctx->followed_threads != 0)
+        --ctx->followed_threads;
+    if (ctx->followed_threads == 0) {
+        restore_replay_signal_handlers(ctx);
+        ctx->active = false;
+    }
     SPDLOG_INFO("Stalker unfollowed current thread");
 }
 
@@ -1296,6 +1776,12 @@ void pgas_stalker_unfollow(pgas_stalker_ctx_t *ctx, GumThreadId thread_id) {
     std::lock_guard lifecycle_lock(ctx->lifecycle_mutex);
     gum_stalker_unfollow(ctx->stalker, thread_id);
     unregister_thread_id(ctx, static_cast<uint64_t>(thread_id));
+    if (ctx->followed_threads != 0)
+        --ctx->followed_threads;
+    if (ctx->followed_threads == 0) {
+        restore_replay_signal_handlers(ctx);
+        ctx->active = false;
+    }
 }
 
 void pgas_stalker_activate(pgas_stalker_ctx_t *ctx, const void *target) {
@@ -1361,6 +1847,73 @@ int pgas_stalker_may_instrument_module(pgas_stalker_ctx_t *ctx,
                : 0;
 }
 
+int pgas_stalker_sigaction(pgas_stalker_ctx_t *ctx, int signal_number,
+                           const struct sigaction *action,
+                           struct sigaction *old_action)
+{
+    const size_t index = replay_signal_index(signal_number);
+    if (ctx == nullptr || index == replay_fault_signals.size())
+        return call_real_sigaction(signal_number, action, old_action);
+
+    if (!ctx->signal_handlers_installed.load(std::memory_order_acquire) &&
+        action == nullptr)
+        return call_real_sigaction(signal_number, action, old_action);
+
+    auto &state = ctx->application_signals[index];
+    struct sigaction requested_action{};
+    if (action != nullptr)
+        requested_action = *action;
+    auto snapshot = load_application_action(state);
+    if (old_action != nullptr) {
+        if ((snapshot.action.sa_flags & SA_RESETHAND) != 0 &&
+            state.reset_claimed.load(std::memory_order_acquire) ==
+                snapshot.publication) {
+            *old_action = {};
+            old_action->sa_handler = SIG_DFL;
+            sigemptyset(&old_action->sa_mask);
+        } else {
+            *old_action = snapshot.action;
+        }
+    }
+    if (action == nullptr)
+        return 0;
+
+    sigset_t old_mask;
+    block_all_signals(old_mask);
+    lock_signal_action_writer(ctx);
+    if (!ctx->signal_handlers_installed.load(std::memory_order_acquire)) {
+        const int result = call_real_sigaction(signal_number, action,
+                                               old_action);
+        unlock_signal_action_writer(ctx);
+        restore_signal_mask(old_mask);
+        return result;
+    }
+
+    snapshot = load_application_action(state);
+    if (old_action != nullptr) {
+        if ((snapshot.action.sa_flags & SA_RESETHAND) != 0 &&
+            state.reset_claimed.load(std::memory_order_acquire) ==
+                snapshot.publication) {
+            *old_action = {};
+            old_action->sa_handler = SIG_DFL;
+            sigemptyset(&old_action->sa_mask);
+        } else {
+            *old_action = snapshot.action;
+        }
+    }
+    const struct sigaction wrapper = replay_wrapper_action(requested_action);
+    if (call_real_sigaction(signal_number, &wrapper, nullptr) != 0) {
+        unlock_signal_action_writer(ctx);
+        restore_signal_mask(old_mask);
+        return -1;
+    }
+    publish_application_action(state, requested_action,
+                               snapshot.publication);
+    unlock_signal_action_writer(ctx);
+    restore_signal_mask(old_mask);
+    return 0;
+}
+
 int pgas_stalker_strict_valid(pgas_stalker_ctx_t *ctx)
 {
     if (ctx == nullptr)
@@ -1374,6 +1927,7 @@ int pgas_stalker_strict_valid(pgas_stalker_ctx_t *ctx)
     for (const auto &record : ctx->threads) {
         const auto &stats = record->stats;
         if (stats.unsupported != 0 || stats.failures != 0 ||
+            stats.active_transactions != 0 || stats.lock_leaks != 0 ||
             stats.follow_events != stats.unfollow_events)
             return 0;
     }
@@ -1448,6 +2002,26 @@ void append_json_string_array(std::string &output,
     output.push_back(']');
 }
 
+void append_remote_by_node(std::string &output,
+                           const pgas_stalker_thread_stats_t &stats)
+{
+    output.push_back('{');
+    bool first = true;
+    for (size_t node = 0; node < 64; ++node) {
+        if (stats.remote_requests_by_node[node] == 0 &&
+            stats.remote_bytes_by_node[node] == 0)
+            continue;
+        if (!first)
+            output.push_back(',');
+        first = false;
+        output += "\"" + std::to_string(node) + "\":{\"requests\":" +
+                  std::to_string(stats.remote_requests_by_node[node]) +
+                  ",\"bytes\":" +
+                  std::to_string(stats.remote_bytes_by_node[node]) + "}";
+    }
+    output.push_back('}');
+}
+
 void write_stdout(const std::string &output)
 {
     size_t offset{};
@@ -1486,6 +2060,33 @@ void pgas_stalker_print_json(
                   ",\"bytes_written\":" + std::to_string(thread.bytes_written) +
                   ",\"cross_line_splits\":" +
                   std::to_string(thread.cross_line_splits) +
+                  ",\"vector\":" + std::to_string(thread.vector) +
+                  ",\"gather\":" + std::to_string(thread.gather) +
+                  ",\"scatter\":" + std::to_string(thread.scatter) +
+                  ",\"rmw\":" + std::to_string(thread.rmw) +
+                  ",\"atomic\":" + std::to_string(thread.atomic) +
+                  ",\"prefetches\":" +
+                  std::to_string(thread.prefetches) +
+                  ",\"prefetch_dropped\":" +
+                  std::to_string(thread.prefetch_dropped) +
+                  ",\"active_lanes\":" +
+                  std::to_string(thread.active_lanes) +
+                  ",\"inactive_lanes\":" +
+                  std::to_string(thread.inactive_lanes) +
+                  ",\"transaction_aborts\":" +
+                  std::to_string(thread.transaction_aborts) +
+                  ",\"signal_cleanups\":" +
+                  std::to_string(thread.signal_cleanups) +
+                  ",\"active_transactions\":" +
+                  std::to_string(thread.active_transactions) +
+                  ",\"lock_contentions\":" +
+                  std::to_string(thread.lock_contentions) +
+                  ",\"lock_leaks\":" + std::to_string(thread.lock_leaks) +
+                  ",\"xstate_failures\":" +
+                  std::to_string(thread.xstate_failures) +
+                  ",\"remote_by_node\":";
+        append_remote_by_node(output, thread);
+        output +=
                   ",\"unsupported\":" + std::to_string(thread.unsupported) +
                   ",\"failures\":" + std::to_string(thread.failures) +
                   ",\"follow_events\":" + std::to_string(thread.follow_events) +
@@ -1496,6 +2097,27 @@ void pgas_stalker_print_json(
         totals.bytes_read += thread.bytes_read;
         totals.bytes_written += thread.bytes_written;
         totals.cross_line_splits += thread.cross_line_splits;
+        totals.vector += thread.vector;
+        totals.gather += thread.gather;
+        totals.scatter += thread.scatter;
+        totals.rmw += thread.rmw;
+        totals.atomic += thread.atomic;
+        totals.prefetches += thread.prefetches;
+        totals.prefetch_dropped += thread.prefetch_dropped;
+        totals.active_lanes += thread.active_lanes;
+        totals.inactive_lanes += thread.inactive_lanes;
+        totals.transaction_aborts += thread.transaction_aborts;
+        totals.signal_cleanups += thread.signal_cleanups;
+        totals.active_transactions += thread.active_transactions;
+        totals.lock_contentions += thread.lock_contentions;
+        totals.lock_leaks += thread.lock_leaks;
+        totals.xstate_failures += thread.xstate_failures;
+        for (size_t node = 0; node < 64; ++node) {
+            totals.remote_requests_by_node[node] +=
+                thread.remote_requests_by_node[node];
+            totals.remote_bytes_by_node[node] +=
+                thread.remote_bytes_by_node[node];
+        }
         totals.unsupported += thread.unsupported;
         totals.failures += thread.failures;
         totals.follow_events += thread.follow_events;
@@ -1516,6 +2138,32 @@ void pgas_stalker_print_json(
               ",\"bytes_written\":" + std::to_string(totals.bytes_written) +
               ",\"cross_line_splits\":" +
               std::to_string(totals.cross_line_splits) +
+              ",\"vector\":" + std::to_string(totals.vector) +
+              ",\"gather\":" + std::to_string(totals.gather) +
+              ",\"scatter\":" + std::to_string(totals.scatter) +
+              ",\"rmw\":" + std::to_string(totals.rmw) +
+              ",\"atomic\":" + std::to_string(totals.atomic) +
+              ",\"prefetches\":" + std::to_string(totals.prefetches) +
+              ",\"prefetch_dropped\":" +
+              std::to_string(totals.prefetch_dropped) +
+              ",\"active_lanes\":" +
+              std::to_string(totals.active_lanes) +
+              ",\"inactive_lanes\":" +
+              std::to_string(totals.inactive_lanes) +
+              ",\"transaction_aborts\":" +
+              std::to_string(totals.transaction_aborts) +
+              ",\"signal_cleanups\":" +
+              std::to_string(totals.signal_cleanups) +
+              ",\"active_transactions\":" +
+              std::to_string(totals.active_transactions) +
+              ",\"lock_contentions\":" +
+              std::to_string(totals.lock_contentions) +
+              ",\"lock_leaks\":" + std::to_string(totals.lock_leaks) +
+              ",\"xstate_failures\":" +
+              std::to_string(totals.xstate_failures) +
+              ",\"remote_by_node\":";
+    append_remote_by_node(output, totals);
+    output +=
               ",\"unsupported\":" + std::to_string(totals.unsupported) +
               ",\"failures\":" + std::to_string(totals.failures) +
               ",\"follow_events\":" + std::to_string(totals.follow_events) +
@@ -1546,6 +2194,7 @@ void pgas_stalker_print_json(
 
 void pgas_stalker_finalize(pgas_stalker_ctx_t *ctx) {
     if (!ctx) return;
+    restore_replay_signal_handlers(ctx);
     if (ctx->stalker) {
         gum_stalker_flush(ctx->stalker);
         gum_stalker_garbage_collect(ctx->stalker);

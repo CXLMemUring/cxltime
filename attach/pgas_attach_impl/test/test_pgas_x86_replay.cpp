@@ -40,6 +40,7 @@ struct replay_transport_state {
     uint8_t watched_value{};
     int reads{};
     int writes{};
+    int fail_read_call{};
     int fail_write_call{};
     bool shadow_unchanged_during_reads{ true };
 };
@@ -49,6 +50,8 @@ int replay_read(void *opaque, uint16_t, uint64_t address, void *destination,
 {
     auto &state = *static_cast<replay_transport_state *>(opaque);
     ++state.reads;
+    if (state.reads == state.fail_read_call)
+        return -EIO;
     if (state.shadow != nullptr &&
         state.shadow[state.watched_offset] != state.watched_value)
         state.shadow_unchanged_during_reads = false;
@@ -158,6 +161,11 @@ TEST_CASE("failed commit remains failed until abort releases its line",
     REQUIRE(pgas_x86_replay_commit(failed) == -EIO);
     REQUIRE(failed.active);
     REQUIRE(failed.failed);
+    REQUIRE(failed.failure_fragment == 0);
+    REQUIRE(failed.failure_lane == 0);
+    REQUIRE(failed.failure_address ==
+            reinterpret_cast<uint64_t>(shadow.data() + 320));
+    REQUIRE(failed.failure_node == 1);
     pgas_x86_replay_abort(failed);
     REQUIRE_FALSE(failed.active);
 
@@ -166,6 +174,30 @@ TEST_CASE("failed commit remains failed until abort releases its line",
     REQUIRE(pgas_x86_replay_prepare(runtime, next, plan,
                                     pgas_x86_access_class::write) == 0);
     pgas_x86_replay_abort(next);
+    pgas_x86_runtime_destroy(runtime);
+}
+
+TEST_CASE("failed second prepare fragment identifies its lane and address",
+          "[pgas][x86][replay][transaction][failure]")
+{
+    alignas(64) std::array<uint8_t, 512> shadow{};
+    replay_transport_state state;
+    state.fail_read_call = 2;
+    auto *runtime = make_replay_runtime(state, shadow.data(), shadow.size());
+    REQUIRE(runtime != nullptr);
+    const auto plan = remote_plan(shadow.data(), shadow.size(), 316, 8);
+    REQUIRE(plan.fragment_count == 2);
+
+    pgas_x86_replay_transaction transaction{};
+    REQUIRE(pgas_x86_replay_prepare(runtime, transaction, plan,
+                                    pgas_x86_access_class::read) == -EIO);
+    REQUIRE_FALSE(transaction.active);
+    REQUIRE(transaction.failed);
+    REQUIRE(transaction.failure_fragment == 1);
+    REQUIRE(transaction.failure_lane == 0);
+    REQUIRE(transaction.failure_address ==
+            reinterpret_cast<uint64_t>(shadow.data() + 320));
+    REQUIRE(transaction.failure_node == 1);
     pgas_x86_runtime_destroy(runtime);
 }
 
@@ -315,6 +347,20 @@ TEST_CASE("replay planning rejects overflow and partial PGAS operands",
             -ERANGE);
     REQUIRE(pgas_x86_plan_contiguous(config, base - 2, 4).status ==
             -ERANGE);
+}
+
+TEST_CASE("invalid active lane reports the exact lane and address",
+          "[pgas][x86][replay][failure]")
+{
+    const auto config = two_node_config();
+    const std::array<uint64_t, 4> addresses{
+        base + 256, base + 260, base + 514, base + 268
+    };
+    const auto plan = pgas_x86_plan_lanes(
+        config, addresses.data(), addresses.size(), 4, 0b0100);
+    REQUIRE(plan.status == -ERANGE);
+    REQUIRE(plan.failure_lane == 2);
+    REQUIRE(plan.failure_address == base + 514);
 }
 
 TEST_CASE("replay planning rejects invalid dimensions",

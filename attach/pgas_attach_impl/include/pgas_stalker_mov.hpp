@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <atomic>
 #include <mutex>
+#include <signal.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -67,6 +68,23 @@ typedef struct {
     uint64_t bytes_read;
     uint64_t bytes_written;
     uint64_t cross_line_splits;
+    uint64_t vector;
+    uint64_t gather;
+    uint64_t scatter;
+    uint64_t rmw;
+    uint64_t atomic;
+    uint64_t prefetches;
+    uint64_t prefetch_dropped;
+    uint64_t active_lanes;
+    uint64_t inactive_lanes;
+    uint64_t transaction_aborts;
+    uint64_t signal_cleanups;
+    uint64_t active_transactions;
+    uint64_t lock_contentions;
+    uint64_t lock_leaks;
+    uint64_t xstate_failures;
+    uint64_t remote_requests_by_node[64];
+    uint64_t remote_bytes_by_node[64];
     uint64_t unsupported;
     uint64_t failures;
     uint64_t follow_events;
@@ -121,6 +139,12 @@ int pgas_stalker_may_instrument_module(pgas_stalker_ctx_t *ctx,
 
 // Return nonzero when strict coverage and per-thread invariants are valid.
 int pgas_stalker_strict_valid(pgas_stalker_ctx_t *ctx);
+
+// Preserve the replay cleanup wrapper while presenting application-visible
+// sigaction semantics for synchronous fault signals.
+int pgas_stalker_sigaction(pgas_stalker_ctx_t *ctx, int signal_number,
+                           const struct sigaction *action,
+                           struct sigaction *old_action);
 
 // Print statistics
 void pgas_stalker_print_stats(pgas_stalker_ctx_t *ctx);
