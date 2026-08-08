@@ -54,6 +54,10 @@ bool pgas_x86_bulk_next(const pgas_x86_runtime_config &config,
 
 int pgas_x86_bulk_copy(pgas_x86_runtime *runtime, void *destination,
                        const void *source, size_t size);
+// Internal seed path: update the writable shadow alias while the application
+// view remains read-only, then publish the same bytes remotely.
+int pgas_x86_bulk_seed(pgas_x86_runtime *runtime, void *destination,
+                       const void *source, size_t size);
 int pgas_x86_bulk_move(pgas_x86_runtime *runtime, void *destination,
                        const void *source, size_t size);
 int pgas_x86_bulk_set(pgas_x86_runtime *runtime, void *destination,

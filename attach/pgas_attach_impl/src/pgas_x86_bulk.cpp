@@ -159,7 +159,7 @@ class bulk_lock_guard {
 
 int execute_bulk(pgas_x86_runtime *runtime, pgas_x86_bulk_kind kind,
                  void *destination, const void *source, unsigned char value,
-                 size_t size)
+                 size_t size, bool internal_shadow_destination = false)
 {
     if (size == 0)
         return 0;
@@ -193,7 +193,8 @@ int execute_bulk(pgas_x86_runtime *runtime, pgas_x86_bulk_kind kind,
                                            chunk.source, staging, chunk.size);
             if (result != 0)
                 return result;
-            std::memcpy(reinterpret_cast<void *>(chunk.source), staging,
+            std::memcpy(pgas_x86_runtime_shadow_write_pointer(
+                            runtime, chunk.source, chunk.size), staging,
                         chunk.size);
         } else {
             std::memcpy(staging,
@@ -201,7 +202,11 @@ int execute_bulk(pgas_x86_runtime *runtime, pgas_x86_bulk_kind kind,
                         chunk.size);
         }
 
-        std::memcpy(reinterpret_cast<void *>(chunk.destination), staging,
+        void *shadow_destination = reinterpret_cast<void *>(chunk.destination);
+        if (internal_shadow_destination)
+            shadow_destination = pgas_x86_runtime_shadow_write_pointer(
+                runtime, chunk.destination, chunk.size);
+        std::memcpy(shadow_destination, staging,
                     chunk.size);
         if (chunk.destination_remote) {
             result = pgas_x86_runtime_write(
@@ -246,7 +251,8 @@ int execute_sync(pgas_x86_runtime *runtime, void *address, size_t size,
                     runtime, chunk.destination_node, chunk.destination,
                     bulk_staging.data(), chunk.size);
                 if (result == 0)
-                    std::memcpy(reinterpret_cast<void *>(chunk.destination),
+                    std::memcpy(pgas_x86_runtime_shadow_write_pointer(
+                                    runtime, chunk.destination, chunk.size),
                                 bulk_staging.data(), chunk.size);
             } else {
                 std::memcpy(bulk_staging.data(),
@@ -369,6 +375,13 @@ int pgas_x86_bulk_copy(pgas_x86_runtime *runtime, void *destination,
 {
     return execute_bulk(runtime, pgas_x86_bulk_kind::copy, destination, source,
                         0, size);
+}
+
+int pgas_x86_bulk_seed(pgas_x86_runtime *runtime, void *destination,
+                       const void *source, size_t size)
+{
+    return execute_bulk(runtime, pgas_x86_bulk_kind::copy, destination, source,
+                        0, size, true);
 }
 
 int pgas_x86_bulk_move(pgas_x86_runtime *runtime, void *destination,

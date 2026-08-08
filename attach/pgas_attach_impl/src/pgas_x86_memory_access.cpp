@@ -40,6 +40,11 @@ struct pgas_x86_runtime {
     }
 
     pgas_x86_runtime_config config;
+    uint64_t shadow_public_base{};
+    uint64_t shadow_size{};
+    uint64_t shadow_write_alias{};
+    uint64_t read_only_base{};
+    uint64_t read_only_size{};
     std::array<std::atomic_flag, lock_stripe_count> line_locks{};
 };
 
@@ -237,6 +242,56 @@ int pgas_x86_runtime_get_config(const pgas_x86_runtime *runtime,
     return 0;
 }
 
+int pgas_x86_runtime_configure_shadow_alias(
+    pgas_x86_runtime *runtime, uint64_t public_base, uint64_t size,
+    void *write_alias, uint64_t read_only_base, uint64_t read_only_size)
+{
+    uint64_t public_end{};
+    uint64_t read_only_end{};
+    if (runtime == nullptr || write_alias == nullptr || size == 0 ||
+        __builtin_add_overflow(public_base, size, &public_end) ||
+        __builtin_add_overflow(read_only_base, read_only_size,
+                               &read_only_end) ||
+        read_only_base < public_base || read_only_end > public_end)
+        return -EINVAL;
+    runtime->shadow_public_base = public_base;
+    runtime->shadow_size = size;
+    runtime->shadow_write_alias = reinterpret_cast<uint64_t>(write_alias);
+    runtime->read_only_base = read_only_base;
+    runtime->read_only_size = read_only_size;
+    return 0;
+}
+
+void *pgas_x86_runtime_shadow_write_pointer(pgas_x86_runtime *runtime,
+                                            uint64_t address, size_t size)
+{
+    uint64_t address_end{};
+    uint64_t shadow_end{};
+    if (runtime == nullptr || runtime->shadow_write_alias == 0 ||
+        __builtin_add_overflow(address, static_cast<uint64_t>(size),
+                               &address_end) ||
+        __builtin_add_overflow(runtime->shadow_public_base,
+                               runtime->shadow_size, &shadow_end) ||
+        address < runtime->shadow_public_base || address_end > shadow_end)
+        return reinterpret_cast<void *>(address);
+    return reinterpret_cast<void *>(runtime->shadow_write_alias +
+                                    address - runtime->shadow_public_base);
+}
+
+bool pgas_x86_runtime_range_is_read_only(const pgas_x86_runtime *runtime,
+                                         uint64_t address, size_t size)
+{
+    uint64_t address_end{};
+    uint64_t read_only_end{};
+    if (runtime == nullptr || runtime->read_only_size == 0 || size == 0 ||
+        __builtin_add_overflow(address, static_cast<uint64_t>(size),
+                               &address_end) ||
+        __builtin_add_overflow(runtime->read_only_base,
+                               runtime->read_only_size, &read_only_end))
+        return false;
+    return address < read_only_end && address_end > runtime->read_only_base;
+}
+
 int pgas_x86_begin_load(pgas_x86_runtime *runtime,
                         pgas_x86_access_event *event)
 {
@@ -260,7 +315,9 @@ int pgas_x86_begin_load(pgas_x86_runtime *runtime,
                 return result;
             }
         }
-        std::memcpy(reinterpret_cast<void *>(event->effective_address),
+        std::memcpy(pgas_x86_runtime_shadow_write_pointer(
+                        runtime, event->effective_address,
+                        event->descriptor->width),
                     buffer.data(), event->descriptor->width);
     }
     return 0;
@@ -279,6 +336,13 @@ int pgas_x86_begin_store(pgas_x86_runtime *runtime,
                                 node_base);
     if (result != 0)
         return result;
+
+    // Preserve native read-only mmap behavior.  The original instruction is
+    // still executed against the protected public view and will raise
+    // SIGSEGV; importantly, no remote mutation happens before that fault.
+    if (pgas_x86_runtime_range_is_read_only(
+            runtime, event->effective_address, event->descriptor->width))
+        return 0;
 
     if (event->target_node != runtime->config.local_node_id) {
         const auto *bytes = static_cast<const uint8_t *>(source);

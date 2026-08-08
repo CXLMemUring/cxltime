@@ -245,6 +245,49 @@ TEST_CASE("cross-line store publishes remote bytes before original shadow store"
     pgas_x86_runtime_destroy(runtime);
 }
 
+TEST_CASE("read-only shadow views refresh through alias and suppress stores",
+          "[pgas][x86][transport][shadow-alias]")
+{
+    alignas(64) std::array<uint8_t, 256> public_shadow{};
+    alignas(64) std::array<uint8_t, 256> write_alias{};
+    fake_transport_state state;
+    for (size_t i = 0; i < 8; ++i)
+        state.remote[32 + i] = static_cast<uint8_t>(0xc0 + i);
+    auto *runtime = make_runtime(
+        state, reinterpret_cast<uint64_t>(public_shadow.data()));
+    REQUIRE(runtime != nullptr);
+    REQUIRE(pgas_x86_runtime_configure_shadow_alias(
+                runtime, reinterpret_cast<uint64_t>(public_shadow.data()),
+                public_shadow.size(), write_alias.data(),
+                reinterpret_cast<uint64_t>(public_shadow.data()), 128) == 0);
+
+    auto load_descriptor = scalar_descriptor(pgas_x86_access_class::read);
+    pgas_x86_access_event load{};
+    load.descriptor = &load_descriptor;
+    load.effective_address =
+        reinterpret_cast<uint64_t>(public_shadow.data() + 32);
+    REQUIRE(pgas_x86_begin_load(runtime, &load) == 0);
+    CHECK(std::memcmp(write_alias.data() + 32, state.remote.data() + 32, 8) ==
+          0);
+    CHECK(std::memcmp(public_shadow.data() + 32, state.remote.data() + 32,
+                      8) != 0);
+    pgas_x86_finish_access(&load);
+
+    state.calls.clear();
+    const std::array<uint8_t, 8> source{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    auto store_descriptor = scalar_descriptor(pgas_x86_access_class::write);
+    pgas_x86_access_event store{};
+    store.descriptor = &store_descriptor;
+    store.effective_address =
+        reinterpret_cast<uint64_t>(public_shadow.data() + 32);
+    REQUIRE(pgas_x86_begin_store(runtime, &store, source.data(),
+                                 source.size()) == 0);
+    CHECK(state.calls.empty());
+    CHECK(store.locks_held);
+    pgas_x86_finish_access(&store);
+    pgas_x86_runtime_destroy(runtime);
+}
+
 TEST_CASE("failed second load segment leaves shadow unchanged",
           "[pgas][x86][transport][failure]")
 {

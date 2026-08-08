@@ -255,7 +255,7 @@ void *pgas_model_mapper::map_fd(int fd, size_t length, off_t offset,
             }
             received += static_cast<size_t>(count);
         }
-        const int result = pgas_x86_bulk_copy(
+        const int result = pgas_x86_bulk_seed(
             config_.runtime, reinterpret_cast<void *>(address + completed),
             seed_buffer.data(), chunk);
         if (result != 0) {

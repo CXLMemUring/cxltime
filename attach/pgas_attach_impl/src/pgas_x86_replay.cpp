@@ -253,7 +253,8 @@ int pgas_x86_replay_prepare(pgas_x86_runtime *runtime,
             const auto &fragment = plan.fragments[i];
             if (!fragment.remote)
                 continue;
-            std::memcpy(reinterpret_cast<void *>(fragment.address),
+            std::memcpy(pgas_x86_runtime_shadow_write_pointer(
+                            runtime, fragment.address, fragment.size),
                         transaction.staging.data() + fragment.byte_offset,
                         fragment.size);
         }

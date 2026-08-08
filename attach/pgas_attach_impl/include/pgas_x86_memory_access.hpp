@@ -128,6 +128,13 @@ pgas_x86_runtime_create(const pgas_x86_runtime_config &config);
 void pgas_x86_runtime_destroy(pgas_x86_runtime *runtime);
 int pgas_x86_runtime_get_config(const pgas_x86_runtime *runtime,
                                 pgas_x86_runtime_config &config);
+int pgas_x86_runtime_configure_shadow_alias(
+    pgas_x86_runtime *runtime, uint64_t public_base, uint64_t size,
+    void *write_alias, uint64_t read_only_base, uint64_t read_only_size);
+void *pgas_x86_runtime_shadow_write_pointer(pgas_x86_runtime *runtime,
+                                            uint64_t address, size_t size);
+bool pgas_x86_runtime_range_is_read_only(const pgas_x86_runtime *runtime,
+                                         uint64_t address, size_t size);
 
 int pgas_x86_begin_load(pgas_x86_runtime *runtime,
                         pgas_x86_access_event *event);
