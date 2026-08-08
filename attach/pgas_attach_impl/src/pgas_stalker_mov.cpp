@@ -15,6 +15,7 @@
 #include "pgas_stalker_mov.hpp"
 #include "pgas_cxlmemsim_integration.hpp"
 #include "pgas_stalker_module_policy.hpp"
+#include "pgas_x86_bulk.hpp"
 #include "pgas_x86_memory_access.hpp"
 #include "pgas_x86_replay.hpp"
 #include "pgas_x86_xstate.hpp"
@@ -35,6 +36,7 @@
 #include <unordered_map>
 
 #include <dlfcn.h>
+#include <asm/prctl.h>
 #include <signal.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -452,6 +454,52 @@ static uint8_t vector_register_bytes(x86_reg reg)
     return 0;
 }
 
+enum class rep_string_kind : uint8_t {
+    none,
+    move,
+    store,
+    compare,
+    scan,
+    load,
+};
+
+static bool decode_rep_string(const cs_insn *insn, rep_string_kind &kind,
+                              uint8_t &element_width)
+{
+    kind = rep_string_kind::none;
+    element_width = 0;
+    if (insn == nullptr || insn->detail == nullptr)
+        return false;
+    const auto &x86 = insn->detail->x86;
+    if (x86.prefix[0] != X86_PREFIX_REP &&
+        x86.prefix[0] != X86_PREFIX_REPNE)
+        return false;
+    switch (insn->id) {
+    case X86_INS_MOVSB: kind = rep_string_kind::move; element_width = 1; break;
+    case X86_INS_MOVSW: kind = rep_string_kind::move; element_width = 2; break;
+    case X86_INS_MOVSD: kind = rep_string_kind::move; element_width = 4; break;
+    case X86_INS_MOVSQ: kind = rep_string_kind::move; element_width = 8; break;
+    case X86_INS_STOSB: kind = rep_string_kind::store; element_width = 1; break;
+    case X86_INS_STOSW: kind = rep_string_kind::store; element_width = 2; break;
+    case X86_INS_STOSD: kind = rep_string_kind::store; element_width = 4; break;
+    case X86_INS_STOSQ: kind = rep_string_kind::store; element_width = 8; break;
+    case X86_INS_CMPSB: kind = rep_string_kind::compare; element_width = 1; break;
+    case X86_INS_CMPSW: kind = rep_string_kind::compare; element_width = 2; break;
+    case X86_INS_CMPSD: kind = rep_string_kind::compare; element_width = 4; break;
+    case X86_INS_CMPSQ: kind = rep_string_kind::compare; element_width = 8; break;
+    case X86_INS_SCASB: kind = rep_string_kind::scan; element_width = 1; break;
+    case X86_INS_SCASW: kind = rep_string_kind::scan; element_width = 2; break;
+    case X86_INS_SCASD: kind = rep_string_kind::scan; element_width = 4; break;
+    case X86_INS_SCASQ: kind = rep_string_kind::scan; element_width = 8; break;
+    case X86_INS_LODSB: kind = rep_string_kind::load; element_width = 1; break;
+    case X86_INS_LODSW: kind = rep_string_kind::load; element_width = 2; break;
+    case X86_INS_LODSD: kind = rep_string_kind::load; element_width = 4; break;
+    case X86_INS_LODSQ: kind = rep_string_kind::load; element_width = 8; break;
+    default: return false;
+    }
+    return true;
+}
+
 // OPT 1: Skip stack-relative memory accesses at JIT time.
 // RSP/RBP-based movs are local stack variables — never CXL addresses.
 static bool is_stack_relative(x86_reg reg) {
@@ -719,6 +767,11 @@ struct memory_callout_data {
     pgas_x86_runtime *runtime;
     pgas_stalker_ctx *context;
     pgas_x86_memory_descriptor descriptor;
+    rep_string_kind rep_kind{};
+    uint8_t rep_element_width{};
+    uint8_t rep_address_size{};
+    uint8_t rep_segment_prefix{};
+    uint32_t saved_flags_offset{};
     GumX86Reg xstate_pointer;
     char labels[5];
 };
@@ -830,6 +883,38 @@ struct pending_access {
 
 static thread_local pending_access current_access;
 static thread_local std::atomic<bool> current_access_signal_active{};
+
+struct pending_rep_string {
+    const memory_callout_data *callout{};
+    uint64_t initial_count{};
+    uint64_t initial_source{};
+    uint64_t initial_destination{};
+    uint64_t source_low{};
+    uint64_t destination_low{};
+    uint64_t total_bytes{};
+    bool backward{};
+    bool active{};
+    pgas_x86_bulk_lock lock{};
+};
+
+static thread_local pending_rep_string current_rep_string;
+static thread_local std::atomic<bool> current_rep_signal_active{};
+
+static void reset_current_rep_string()
+{
+    current_rep_string.callout = nullptr;
+    current_rep_string.initial_count = 0;
+    current_rep_string.initial_source = 0;
+    current_rep_string.initial_destination = 0;
+    current_rep_string.source_low = 0;
+    current_rep_string.destination_low = 0;
+    current_rep_string.total_bytes = 0;
+    current_rep_string.backward = false;
+    current_rep_string.active = false;
+    current_rep_string.lock.runtime = nullptr;
+    current_rep_string.lock.acquired = 0;
+    current_rep_string.lock.active = false;
+}
 
 static_assert(std::atomic<bool>::is_always_lock_free);
 static_assert(std::atomic<unsigned>::is_always_lock_free);
@@ -988,6 +1073,25 @@ void replay_signal_handler(int signal_number, siginfo_t *info, void *ucontext)
                 &current_thread_record->stats.active_transactions,
                 UINT64_C(1), __ATOMIC_RELAXED);
         }
+    }
+
+    if (current_thread_context == ctx && current_thread_record != nullptr &&
+        current_rep_signal_active.exchange(false,
+                                           std::memory_order_acq_rel)) {
+        pgas_x86_bulk_unlock_ranges(current_rep_string.lock);
+        reset_current_rep_string();
+        __atomic_fetch_add(
+            &current_thread_record->stats.transaction_aborts, UINT64_C(1),
+            __ATOMIC_RELAXED);
+        __atomic_fetch_add(
+            &current_thread_record->stats.signal_cleanups, UINT64_C(1),
+            __ATOMIC_RELAXED);
+        __atomic_fetch_add(&current_thread_record->stats.failures,
+                           UINT64_C(1), __ATOMIC_RELAXED);
+        // Network commits are not async-signal-safe.  A fault after a native
+        // REP may have changed only the shadow, so continuing into an
+        // application longjmp would expose stale remote state.  Fail closed.
+        restore_default_and_raise(signal_number);
     }
 
     auto &state = ctx->application_signals[signal_index];
@@ -1226,6 +1330,300 @@ static void runtime_failure(void *, const pgas_x86_failure &failure)
     if (current_thread_record != nullptr)
         ++current_thread_record->stats.failures;
     emit_fatal_failure(failure, "none");
+}
+
+static bool rep_range_low(uint64_t pointer, uint64_t count, uint8_t width,
+                          bool backward, uint64_t &low, uint64_t &bytes)
+{
+    if (__builtin_mul_overflow(count, static_cast<uint64_t>(width), &bytes))
+        return false;
+    low = pointer;
+    if (backward && count != 0) {
+        uint64_t delta{};
+        if (__builtin_mul_overflow(count - 1,
+                                   static_cast<uint64_t>(width), &delta) ||
+            pointer < delta)
+            return false;
+        low = pointer - delta;
+    }
+    uint64_t end{};
+    return !__builtin_add_overflow(low, bytes, &end);
+}
+
+static bool rep_range_intersects(const memory_callout_data *cd,
+                                 uint64_t address, uint64_t size)
+{
+    if (size == 0)
+        return false;
+    uint64_t end{};
+    uint64_t pgas_end{};
+    if (__builtin_add_overflow(address, size, &end) ||
+        __builtin_add_overflow(cd->pgas_base, cd->pgas_size, &pgas_end))
+        return false;
+    return address < pgas_end && end > cd->pgas_base;
+}
+
+static bool rep_range32_intersects(const memory_callout_data *cd,
+                                   uint32_t pointer, uint64_t count,
+                                   uint8_t width, bool backward,
+                                   uint64_t segment_base, bool &overflow)
+{
+    overflow = false;
+    uint64_t bytes{};
+    if (__builtin_mul_overflow(count, static_cast<uint64_t>(width), &bytes)) {
+        overflow = true;
+        return false;
+    }
+    if (bytes == 0)
+        return false;
+    constexpr uint64_t address_space = UINT64_C(1) << 32;
+    bool crossing_intersects = false;
+    const uint64_t crossing_tail = pointer % width;
+    if (crossing_tail != 0) {
+        const uint64_t crossing_start =
+            address_space - width + crossing_tail;
+        const uint64_t distance = backward
+            ? ((static_cast<uint64_t>(pointer) + address_space -
+                crossing_start) % address_space) / width
+            : ((crossing_start + address_space -
+                static_cast<uint64_t>(pointer)) % address_space) / width;
+        if (distance < count) {
+            uint64_t boundary{};
+            if (__builtin_add_overflow(segment_base, address_space,
+                                       &boundary) ||
+                crossing_tail > UINT64_MAX - boundary) {
+                overflow = true;
+                return false;
+            }
+            crossing_intersects = rep_range_intersects(
+                cd, boundary, crossing_tail);
+        }
+    }
+    if (bytes >= address_space) {
+        uint64_t end{};
+        if (__builtin_add_overflow(segment_base, address_space, &end)) {
+            overflow = true;
+            return false;
+        }
+        return crossing_intersects ||
+               rep_range_intersects(cd, segment_base, address_space);
+    }
+
+    uint32_t start = pointer;
+    if (backward) {
+        const uint64_t delta = ((count - 1) * width) % address_space;
+        start = static_cast<uint32_t>(pointer - static_cast<uint32_t>(delta));
+    }
+    const uint64_t first_size = std::min<uint64_t>(
+        bytes, address_space - static_cast<uint64_t>(start));
+    uint64_t first_address{};
+    if (__builtin_add_overflow(segment_base, static_cast<uint64_t>(start),
+                               &first_address)) {
+        overflow = true;
+        return false;
+    }
+    if (first_size > UINT64_MAX - first_address) {
+        overflow = true;
+        return false;
+    }
+    if (crossing_intersects ||
+        rep_range_intersects(cd, first_address, first_size))
+        return true;
+    const uint64_t second_size = bytes - first_size;
+    if (second_size != 0 && second_size > UINT64_MAX - segment_base) {
+        overflow = true;
+        return false;
+    }
+    return second_size != 0 &&
+           rep_range_intersects(cd, segment_base, second_size);
+}
+
+static void rep_sync_or_fail(const memory_callout_data *cd, uint64_t address,
+                             uint64_t bytes, bool refresh)
+{
+    if (bytes == 0 || !rep_range_intersects(cd, address, bytes))
+        return;
+    if (bytes > SIZE_MAX)
+        strict_access_failure(cd, address, -EOVERFLOW);
+    const int result = refresh
+        ? pgas_x86_bulk_refresh_locked(
+              cd->runtime, reinterpret_cast<void *>(address),
+              static_cast<size_t>(bytes))
+        : pgas_x86_bulk_flush_locked(
+              cd->runtime, reinterpret_cast<const void *>(address),
+              static_cast<size_t>(bytes));
+    if (result != 0)
+        strict_access_failure(
+            cd, address, result,
+            refresh ? pgas_x86_transaction_phase::prepare
+                    : pgas_x86_transaction_phase::commit);
+}
+
+static void rep_pre_callout(GumCpuContext *cpu_context, gpointer user_data)
+{
+    auto *cd = static_cast<memory_callout_data *>(user_data);
+    if (current_rep_string.active)
+        strict_access_failure(cd, cpu_context->rip, -EBUSY);
+
+    uint64_t saved_flags{};
+    std::memcpy(&saved_flags,
+                reinterpret_cast<const void *>(
+                    cpu_context->rsp + cd->saved_flags_offset),
+                sizeof(saved_flags));
+    const bool backward = (saved_flags & (UINT64_C(1) << 10)) != 0;
+    const uint64_t count = cd->rep_address_size == 4
+        ? static_cast<uint32_t>(cpu_context->rcx) : cpu_context->rcx;
+    if (count == 0) {
+        reset_current_rep_string();
+        return;
+    }
+    uint64_t source_pointer = cd->rep_address_size == 4
+        ? static_cast<uint32_t>(cpu_context->rsi) : cpu_context->rsi;
+    const uint64_t destination_pointer = cd->rep_address_size == 4
+        ? static_cast<uint32_t>(cpu_context->rdi) : cpu_context->rdi;
+    uint64_t segment_base{};
+    if (cd->rep_segment_prefix == X86_PREFIX_FS ||
+        cd->rep_segment_prefix == X86_PREFIX_GS) {
+        unsigned long queried_base{};
+        const int request = cd->rep_segment_prefix == X86_PREFIX_FS
+            ? ARCH_GET_FS : ARCH_GET_GS;
+        if (syscall(SYS_arch_prctl, request, &queried_base) != 0)
+            strict_access_failure(cd, source_pointer, -errno);
+        segment_base = queried_base;
+    }
+
+    const bool has_source = cd->rep_kind == rep_string_kind::move ||
+                            cd->rep_kind == rep_string_kind::compare ||
+                            cd->rep_kind == rep_string_kind::load;
+    const bool has_destination = cd->rep_kind == rep_string_kind::move ||
+                                 cd->rep_kind == rep_string_kind::store ||
+                                 cd->rep_kind == rep_string_kind::compare ||
+                                 cd->rep_kind == rep_string_kind::scan;
+    if (cd->rep_address_size == 4) {
+        bool source_overflow{};
+        bool destination_overflow{};
+        const bool source_remote = has_source && rep_range32_intersects(
+            cd, static_cast<uint32_t>(cpu_context->rsi), count,
+            cd->rep_element_width, backward, segment_base, source_overflow);
+        const bool destination_remote = has_destination &&
+            rep_range32_intersects(
+                cd, static_cast<uint32_t>(cpu_context->rdi), count,
+                cd->rep_element_width, backward, 0, destination_overflow);
+        if (source_overflow || destination_overflow)
+            strict_access_failure(cd, source_pointer, -EOVERFLOW);
+        if (source_remote || destination_remote)
+            strict_access_failure(
+                cd, source_remote ? source_pointer : destination_pointer,
+                -ENOTSUP);
+        reset_current_rep_string();
+        return;
+    }
+    if (cd->rep_address_size != 8)
+        strict_access_failure(cd, source_pointer, -ENOTSUP);
+    if (segment_base != 0 &&
+            __builtin_add_overflow(source_pointer,
+                                   segment_base,
+                                   &source_pointer))
+        strict_access_failure(cd, source_pointer, -EOVERFLOW);
+    uint64_t source_low{};
+    uint64_t destination_low{};
+    uint64_t source_bytes{};
+    uint64_t destination_bytes{};
+
+    if (has_source &&
+        !rep_range_low(source_pointer, count, cd->rep_element_width,
+                       backward, source_low, source_bytes))
+        strict_access_failure(cd, source_pointer, -EOVERFLOW);
+    if (has_destination &&
+        !rep_range_low(destination_pointer, count, cd->rep_element_width,
+                       backward, destination_low, destination_bytes))
+        strict_access_failure(cd, destination_pointer, -EOVERFLOW);
+
+    const bool source_remote = has_source &&
+        rep_range_intersects(cd, source_low, source_bytes);
+    const bool destination_remote = has_destination &&
+        rep_range_intersects(cd, destination_low, destination_bytes);
+    if (!source_remote && !destination_remote) {
+        reset_current_rep_string();
+        return;
+    }
+    if (bind_current_thread(cd->context) == nullptr)
+        strict_access_failure(cd, source_remote ? source_low : destination_low,
+                              -ESRCH);
+
+    reset_current_rep_string();
+    current_rep_string.callout = cd;
+    current_rep_string.initial_count = count;
+    current_rep_string.initial_source = source_pointer;
+    current_rep_string.initial_destination = destination_pointer;
+    current_rep_string.source_low = source_low;
+    current_rep_string.destination_low = destination_low;
+    current_rep_string.total_bytes = source_bytes != 0
+        ? source_bytes : destination_bytes;
+    current_rep_string.backward = backward;
+    current_rep_string.active = true;
+
+    std::array<pgas_x86_bulk_range, 2> ranges{};
+    size_t range_count{};
+    if (has_source)
+        ranges[range_count++] = { source_low, source_bytes };
+    if (has_destination)
+        ranges[range_count++] = { destination_low, destination_bytes };
+    current_rep_signal_active.store(true, std::memory_order_release);
+    const int lock_result = pgas_x86_bulk_lock_ranges(
+        cd->runtime, ranges.data(), range_count, current_rep_string.lock);
+    if (lock_result != 0)
+        strict_access_failure(cd,
+                              source_remote ? source_low : destination_low,
+                              lock_result,
+                              pgas_x86_transaction_phase::prepare);
+
+    if (cd->rep_kind == rep_string_kind::move ||
+        cd->rep_kind == rep_string_kind::compare ||
+        cd->rep_kind == rep_string_kind::load)
+        rep_sync_or_fail(cd, source_low, source_bytes, true);
+    if (cd->rep_kind == rep_string_kind::compare ||
+        cd->rep_kind == rep_string_kind::scan)
+        rep_sync_or_fail(cd, destination_low, destination_bytes, true);
+    __atomic_fetch_add(&cd->stats->callouts_fired, 1, __ATOMIC_RELAXED);
+}
+
+static void rep_post_callout(GumCpuContext *cpu_context, gpointer user_data)
+{
+    auto *cd = static_cast<memory_callout_data *>(user_data);
+    if (!current_rep_string.active)
+        return;
+    if (current_rep_string.callout != cd ||
+        cpu_context->rcx > current_rep_string.initial_count)
+        strict_access_failure(cd, cpu_context->rip, -EINVAL,
+                              pgas_x86_transaction_phase::commit);
+    const uint64_t consumed =
+        current_rep_string.initial_count - cpu_context->rcx;
+    uint64_t consumed_bytes{};
+    uint64_t destination_low{};
+    if (__builtin_mul_overflow(consumed,
+                               static_cast<uint64_t>(cd->rep_element_width),
+                               &consumed_bytes))
+        strict_access_failure(cd, current_rep_string.initial_destination,
+                              -EOVERFLOW,
+                              pgas_x86_transaction_phase::commit);
+    if ((cd->rep_kind == rep_string_kind::move ||
+         cd->rep_kind == rep_string_kind::store) &&
+        !rep_range_low(current_rep_string.initial_destination, consumed,
+                       cd->rep_element_width, current_rep_string.backward,
+                       destination_low, consumed_bytes))
+        strict_access_failure(cd, current_rep_string.initial_destination,
+                              -EOVERFLOW,
+                              pgas_x86_transaction_phase::commit);
+    if (cd->rep_kind == rep_string_kind::move ||
+        cd->rep_kind == rep_string_kind::store)
+        rep_sync_or_fail(cd, destination_low, consumed_bytes, false);
+    if (consumed != 0)
+        pgas_stalker_record_bulk(PGAS_BULK_REP_STRING,
+                                 static_cast<size_t>(consumed_bytes));
+    current_rep_signal_active.store(false, std::memory_order_release);
+    pgas_x86_bulk_unlock_ranges(current_rep_string.lock);
+    reset_current_rep_string();
 }
 
 static void memory_pre_callout(GumCpuContext *cpu_context, gpointer user_data)
@@ -1475,10 +1873,24 @@ static void emit_enveloped_callout(GumStalkerIterator *iterator,
                                   cd->xstate_pointer, frame))
         strict_access_failure(cd, cd->descriptor.instruction_address,
                               -ENOTSUP);
+    cd->saved_flags_offset = frame.saved_flags_offset;
     gum_stalker_iterator_put_callout(iterator, callout, cd, nullptr);
     if (!pgas_x86_emit_state_restore(writer, cd->context->xstate, frame))
         strict_access_failure(cd, cd->descriptor.instruction_address,
                               -ENOTSUP);
+}
+
+static void emit_rep_string_access(GumStalkerIterator *iterator,
+                                   GumStalkerOutput *output,
+                                   memory_callout_data *cd)
+{
+    auto *writer = output->writer.x86;
+    if (!choose_xstate_pointer(cd->descriptor, cd->xstate_pointer))
+        strict_access_failure(cd, cd->descriptor.instruction_address,
+                              -ENOTSUP);
+    emit_enveloped_callout(iterator, writer, cd, rep_pre_callout);
+    gum_stalker_iterator_keep(iterator);
+    emit_enveloped_callout(iterator, writer, cd, rep_post_callout);
 }
 
 static void emit_memory_access(GumStalkerIterator *iterator,
@@ -1560,6 +1972,70 @@ static void transform_block(GumStalkerIterator *iterator,
         }
         if (!instrument_block) {
             gum_stalker_iterator_keep(iterator);
+            continue;
+        }
+
+        rep_string_kind rep_kind{};
+        uint8_t rep_width{};
+        if (decode_rep_string(insn, rep_kind, rep_width)) {
+            if (!ctx->config.hook_rep_movs) {
+                gum_stalker_iterator_keep(iterator);
+                continue;
+            }
+            auto *cd = alloc_callout_data();
+            if (cd == nullptr) {
+                gum_stalker_iterator_keep(iterator);
+                continue;
+            }
+            *cd = {};
+            cd->pgas_base = ctx->config.pgas_base_addr;
+            cd->pgas_size = ctx->config.pgas_region_size;
+            cd->local_node_id = ctx->config.local_node_id;
+            cd->num_nodes = ctx->config.num_nodes;
+            cd->stats = &ctx->stats;
+            cd->runtime = ctx->runtime;
+            cd->context = ctx;
+            cd->rep_kind = rep_kind;
+            cd->rep_element_width = rep_width;
+            cd->rep_address_size = insn->detail->x86.addr_size;
+            cd->rep_segment_prefix = insn->detail->x86.prefix[1];
+            auto &descriptor = cd->descriptor;
+            descriptor.instruction_address = insn->address;
+            descriptor.instruction_id = insn->id;
+            descriptor.width = rep_width;
+            descriptor.replayable = true;
+            descriptor.access_class =
+                rep_kind == rep_string_kind::store
+                    ? pgas_x86_access_class::write
+                    : (rep_kind == rep_string_kind::move
+                           ? pgas_x86_access_class::read_modify_write
+                           : pgas_x86_access_class::read);
+            std::snprintf(descriptor.mnemonic, sizeof(descriptor.mnemonic),
+                          "%s", insn->mnemonic);
+            descriptor.instruction_size = static_cast<uint8_t>(
+                std::min<size_t>(insn->size,
+                                 descriptor.instruction_bytes.size()));
+            std::memcpy(descriptor.instruction_bytes.data(), insn->bytes,
+                        descriptor.instruction_size);
+            Dl_info module_info{};
+            if (dladdr(reinterpret_cast<const void *>(insn->address),
+                       &module_info) != 0) {
+                const auto module = basename_from_path(module_info.dli_fname);
+                std::snprintf(descriptor.module_basename,
+                              sizeof(descriptor.module_basename), "%s",
+                              module.c_str());
+            }
+            emit_rep_string_access(iterator, output, cd);
+            if (descriptor.access_class == pgas_x86_access_class::read)
+                __atomic_fetch_add(&ctx->stats.translated_reads, 1,
+                                   __ATOMIC_RELAXED);
+            else if (descriptor.access_class == pgas_x86_access_class::write)
+                __atomic_fetch_add(&ctx->stats.translated_writes, 1,
+                                   __ATOMIC_RELAXED);
+            else
+                __atomic_fetch_add(
+                    &ctx->stats.translated_read_modify_writes, 1,
+                    __ATOMIC_RELAXED);
             continue;
         }
 

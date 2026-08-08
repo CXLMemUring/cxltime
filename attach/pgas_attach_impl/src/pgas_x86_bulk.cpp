@@ -215,6 +215,55 @@ int execute_bulk(pgas_x86_runtime *runtime, pgas_x86_bulk_kind kind,
     return completed == size ? 0 : -ERANGE;
 }
 
+int execute_sync(pgas_x86_runtime *runtime, void *address, size_t size,
+                 bool refresh, bool acquire_chunk_locks)
+{
+    if (size == 0)
+        return 0;
+    if (runtime == nullptr || address == nullptr)
+        return -EINVAL;
+    pgas_x86_runtime_config config{};
+    int result = pgas_x86_runtime_get_config(runtime, config);
+    if (result != 0)
+        return result;
+    const auto plan = pgas_x86_plan_bulk(
+        pgas_x86_bulk_kind::set, reinterpret_cast<uint64_t>(address), 0,
+        size);
+    if (plan.status != 0)
+        return plan.status;
+    uint64_t completed = 0;
+    pgas_x86_bulk_chunk chunk{};
+    while (pgas_x86_bulk_next(config, plan, completed, chunk)) {
+        bulk_lock_guard locks(runtime);
+        if (acquire_chunk_locks) {
+            result = locks.acquire(config, chunk, pgas_x86_bulk_kind::set);
+            if (result != 0)
+                return result;
+        }
+        if (chunk.destination_remote) {
+            if (refresh) {
+                result = pgas_x86_runtime_read(
+                    runtime, chunk.destination_node, chunk.destination,
+                    bulk_staging.data(), chunk.size);
+                if (result == 0)
+                    std::memcpy(reinterpret_cast<void *>(chunk.destination),
+                                bulk_staging.data(), chunk.size);
+            } else {
+                std::memcpy(bulk_staging.data(),
+                            reinterpret_cast<const void *>(chunk.destination),
+                            chunk.size);
+                result = pgas_x86_runtime_write(
+                    runtime, chunk.destination_node, chunk.destination,
+                    bulk_staging.data(), chunk.size);
+            }
+            if (result != 0)
+                return result;
+        }
+        completed += chunk.size;
+    }
+    return completed == size ? 0 : -ERANGE;
+}
+
 } // namespace
 
 pgas_x86_bulk_plan pgas_x86_plan_bulk(pgas_x86_bulk_kind kind,
@@ -334,6 +383,106 @@ int pgas_x86_bulk_set(pgas_x86_runtime *runtime, void *destination,
 {
     return execute_bulk(runtime, pgas_x86_bulk_kind::set, destination, nullptr,
                         value, size);
+}
+
+int pgas_x86_bulk_refresh(pgas_x86_runtime *runtime, void *address,
+                          size_t size)
+{
+    return execute_sync(runtime, address, size, true, true);
+}
+
+int pgas_x86_bulk_flush(pgas_x86_runtime *runtime, const void *address,
+                        size_t size)
+{
+    return execute_sync(runtime, const_cast<void *>(address), size, false,
+                        true);
+}
+
+int pgas_x86_bulk_lock_ranges(pgas_x86_runtime *runtime,
+                              const pgas_x86_bulk_range *ranges,
+                              size_t range_count,
+                              pgas_x86_bulk_lock &lock)
+{
+    if (runtime == nullptr || (range_count != 0 && ranges == nullptr) ||
+        lock.active)
+        return -EINVAL;
+    pgas_x86_runtime_config config{};
+    int result = pgas_x86_runtime_get_config(runtime, config);
+    if (result != 0)
+        return result;
+    uint64_t pgas_end{};
+    if (__builtin_add_overflow(config.pgas_base, config.pgas_size,
+                               &pgas_end))
+        return -EOVERFLOW;
+
+    constexpr size_t stripe_count = 4096;
+    std::array<bool, stripe_count> seen{};
+    std::array<uint64_t, stripe_count> lines{};
+    size_t line_count = 0;
+    for (size_t range_index = 0;
+         range_index < range_count && line_count != stripe_count;
+         ++range_index) {
+        const auto &range = ranges[range_index];
+        if (range.size == 0)
+            continue;
+        uint64_t range_end{};
+        if (__builtin_add_overflow(range.address, range.size, &range_end))
+            return -EOVERFLOW;
+        uint64_t cursor = std::max(range.address, config.pgas_base);
+        const uint64_t clipped_end = std::min(range_end, pgas_end);
+        if (cursor >= clipped_end)
+            continue;
+        cursor &= ~(uint64_t(cache_line_size) - 1);
+        const uint64_t last =
+            (clipped_end - 1) & ~(uint64_t(cache_line_size) - 1);
+        for (;;) {
+            const size_t stripe = static_cast<size_t>(
+                (cursor / cache_line_size) % stripe_count);
+            if (!seen[stripe]) {
+                seen[stripe] = true;
+                lines[line_count++] = cursor;
+                if (line_count == stripe_count)
+                    break;
+            }
+            if (cursor == last)
+                break;
+            cursor += cache_line_size;
+        }
+    }
+    lock.runtime = runtime;
+    lock.acquired = 0;
+    lock.active = true;
+    result = pgas_x86_runtime_lock_lines(
+        runtime, lines.data(), line_count, lock.stripes.data(),
+        lock.stripes.size(), lock.acquired);
+    if (result != 0) {
+        pgas_x86_bulk_unlock_ranges(lock);
+        return result;
+    }
+    return 0;
+}
+
+void pgas_x86_bulk_unlock_ranges(pgas_x86_bulk_lock &lock)
+{
+    if (lock.active)
+        pgas_x86_runtime_unlock_lines(lock.runtime, lock.stripes.data(),
+                                      lock.acquired);
+    lock.runtime = nullptr;
+    lock.acquired = 0;
+    lock.active = false;
+}
+
+int pgas_x86_bulk_refresh_locked(pgas_x86_runtime *runtime, void *address,
+                                 size_t size)
+{
+    return execute_sync(runtime, address, size, true, false);
+}
+
+int pgas_x86_bulk_flush_locked(pgas_x86_runtime *runtime,
+                               const void *address, size_t size)
+{
+    return execute_sync(runtime, const_cast<void *>(address), size, false,
+                        false);
 }
 
 } // namespace bpftime::attach

@@ -381,3 +381,74 @@ TEST_CASE("bulk operations serialize threads touching the same remote line",
     CHECK((is_first || is_second));
     pgas_x86_runtime_destroy(runtime);
 }
+
+TEST_CASE("bulk refresh and flush synchronize shadow in bounded chunks",
+          "[pgas][x86][bulk][sync]")
+{
+    std::vector<uint8_t> shadow(3 * node_size, 0x11);
+    bulk_transport_state transport;
+    auto *runtime = make_bulk_runtime(shadow, transport);
+    REQUIRE(runtime != nullptr);
+    auto *remote = shadow.data() + node_size;
+    fill_pattern(transport.nodes[1].data(), node_size, 61);
+
+    REQUIRE(pgas_x86_bulk_refresh(runtime, remote, node_size) == 0);
+    CHECK(std::memcmp(remote, transport.nodes[1].data(), node_size) == 0);
+    fill_pattern(remote, node_size, 173);
+    REQUIRE(pgas_x86_bulk_flush(runtime, remote, node_size) == 0);
+    CHECK(std::memcmp(remote, transport.nodes[1].data(), node_size) == 0);
+    pgas_x86_runtime_destroy(runtime);
+}
+
+TEST_CASE("bulk range lock spans refresh native update and flush",
+          "[pgas][x86][bulk][sync][thread]")
+{
+    std::vector<uint8_t> shadow(3 * node_size, 0x11);
+    bulk_transport_state transport;
+    auto *runtime = make_bulk_runtime(shadow, transport);
+    REQUIRE(runtime != nullptr);
+    auto *remote = shadow.data() + node_size + 256;
+    std::array<uint8_t, 64> competing{};
+    competing.fill(0x77);
+    transport.nodes[1].at(256) = 0x31;
+
+    pgas_x86_bulk_lock lock{};
+    const pgas_x86_bulk_range range{
+        reinterpret_cast<uint64_t>(remote), competing.size()
+    };
+    REQUIRE(pgas_x86_bulk_lock_ranges(runtime, &range, 1, lock) == 0);
+    REQUIRE(lock.active);
+    REQUIRE(pgas_x86_bulk_refresh_locked(runtime, remote,
+                                         competing.size()) == 0);
+    CHECK(remote[0] == 0x31);
+
+    std::atomic<bool> started{};
+    std::atomic<bool> completed{};
+    std::atomic<int> contender_status{ -1 };
+    std::thread contender([&] {
+        started.store(true, std::memory_order_release);
+        contender_status = pgas_x86_bulk_copy(
+            runtime, remote, competing.data(), competing.size());
+        completed.store(true, std::memory_order_release);
+    });
+    while (!started.load(std::memory_order_acquire))
+        std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK_FALSE(completed.load(std::memory_order_acquire));
+
+    std::memset(remote, 0x42, competing.size());
+    REQUIRE(pgas_x86_bulk_flush_locked(runtime, remote,
+                                       competing.size()) == 0);
+    pgas_x86_bulk_unlock_ranges(lock);
+    contender.join();
+    CHECK(completed.load(std::memory_order_acquire));
+    CHECK(contender_status == 0);
+    CHECK(std::memcmp(transport.nodes[1].data() + 256,
+                      competing.data(), competing.size()) == 0);
+
+    pgas_x86_bulk_lock overflow{};
+    const pgas_x86_bulk_range invalid{ UINT64_MAX - 3, 8 };
+    CHECK(pgas_x86_bulk_lock_ranges(runtime, &invalid, 1, overflow) ==
+          -EOVERFLOW);
+    pgas_x86_runtime_destroy(runtime);
+}
