@@ -46,7 +46,8 @@ using namespace bpftime::attach;
 #if defined(__x86_64__)
 
 bool bpftime::attach::pgas_x86_emit_range_gate(
-    GumX86Writer *writer, GumX86Reg address_register,
+    GumX86Writer *writer, GumX86Reg base_register,
+    GumX86Reg index_register, uint8_t scale,
     GumX86Reg scratch_start, GumX86Reg scratch_end,
     GumX86Reg scratch_bound, int64_t displacement, uint8_t width,
     uint64_t pgas_base,
@@ -58,9 +59,14 @@ bool bpftime::attach::pgas_x86_emit_range_gate(
         outside_label == nullptr || partial_label == nullptr ||
         overflow_label == nullptr || width == 0 || width > 64 ||
         pgas_size == 0 || pgas_base > UINT64_MAX - pgas_size ||
-        address_register == scratch_start ||
-        address_register == scratch_end ||
-        address_register == scratch_bound || scratch_start == scratch_end ||
+        (base_register == GUM_X86_NONE &&
+         index_register == GUM_X86_NONE) ||
+        (index_register != GUM_X86_NONE && scale != 1 && scale != 2 &&
+         scale != 4 && scale != 8) ||
+        base_register == scratch_start || base_register == scratch_end ||
+        base_register == scratch_bound || index_register == scratch_start ||
+        index_register == scratch_end || index_register == scratch_bound ||
+        scratch_start == scratch_end ||
         scratch_start == scratch_bound || scratch_end == scratch_bound) {
         return false;
     }
@@ -83,8 +89,19 @@ bool bpftime::attach::pgas_x86_emit_range_gate(
     if (!gum_x86_writer_put_push_reg(writer, scratch_start) ||
         !gum_x86_writer_put_push_reg(writer, scratch_end) ||
         !gum_x86_writer_put_push_reg(writer, scratch_bound) ||
-        !gum_x86_writer_put_mov_reg_reg(writer, scratch_start,
-                                        address_register) ||
+        (base_register == GUM_X86_NONE
+             ? !gum_x86_writer_put_mov_reg_u64(writer, scratch_start, 0)
+             : !gum_x86_writer_put_mov_reg_reg(writer, scratch_start,
+                                               base_register)) ||
+        (index_register != GUM_X86_NONE &&
+         (!gum_x86_writer_put_mov_reg_reg(writer, scratch_end,
+                                          index_register) ||
+          (scale > 1 &&
+           !gum_x86_writer_put_shl_reg_u8(
+               writer, scratch_end,
+               scale == 2 ? 1 : (scale == 4 ? 2 : 3))) ||
+          !gum_x86_writer_put_add_reg_reg(writer, scratch_start,
+                                          scratch_end))) ||
         (displacement != 0 &&
          !gum_x86_writer_put_add_reg_imm(writer, scratch_start,
                                          displacement)) ||
@@ -500,12 +517,13 @@ static bool decode_rep_string(const cs_insn *insn, rep_string_kind &kind,
     return true;
 }
 
-// OPT 1: Skip stack-relative memory accesses at JIT time.
-// RSP/RBP-based movs are local stack variables — never CXL addresses.
+// OPT 1: Skip stack-pointer-relative memory accesses at JIT time.  RBP is a
+// general-purpose register in optimized code built with frame-pointer
+// omission and is commonly used as a tensor base, so it must go through the
+// runtime range gate.
 static bool is_stack_relative(x86_reg reg) {
     switch (reg) {
     case X86_REG_RSP: case X86_REG_ESP: case X86_REG_SP: case X86_REG_SPL:
-    case X86_REG_RBP: case X86_REG_EBP: case X86_REG_BP: case X86_REG_BPL:
         return true;
     default:
         return false;
@@ -518,6 +536,10 @@ static bool analyze_memory_instruction(
 {
     *out = {};
     if (insn == nullptr || insn->detail == nullptr)
+        return false;
+    // LEA has a memory-shaped encoding but only performs integer address
+    // arithmetic; it never dereferences the effective address.
+    if (insn->id == X86_INS_LEA)
         return false;
 
     out->instruction_address = insn->address;
@@ -1267,7 +1289,7 @@ static uint16_t target_node_for(const memory_callout_data *cd,
             access_class_name(failure.access_class), failure.segment_index,
             failure.target_node, failure.transport_error,
             failure.transport_error, unsupported);
-    dprintf(STDOUT_FILENO,
+    dprintf(STDERR_FILENO,
             "{\"kind\":\"pgas_x86_failure\",\"thread_id\":%lu,"
             "\"pc\":%lu,\"mnemonic\":\"%s\",\"instruction_id\":%u,"
             "\"instruction_bytes\":\"%s\",\"module\":\"%s\","
@@ -1901,12 +1923,20 @@ static void emit_memory_access(GumStalkerIterator *iterator,
     const auto &descriptor = cd->descriptor;
     if (!choose_xstate_pointer(descriptor, cd->xstate_pointer))
         strict_access_failure(cd, descriptor.instruction_address, -ENOTSUP);
-    const bool simple_address =
-        descriptor.base_register != X86_REG_INVALID &&
+    const auto base =
+        cs_to_gum_reg(static_cast<x86_reg>(descriptor.base_register));
+    const auto index =
+        cs_to_gum_reg(static_cast<x86_reg>(descriptor.index_register));
+    const bool scalar_address =
         descriptor.base_register != X86_REG_RIP &&
-        descriptor.index_register == X86_REG_INVALID;
+        (descriptor.base_register == X86_REG_INVALID ||
+         base != GUM_X86_NONE) &&
+        (descriptor.index_register == X86_REG_INVALID ||
+         index != GUM_X86_NONE) &&
+        (descriptor.base_register != X86_REG_INVALID ||
+         descriptor.index_register != X86_REG_INVALID);
     std::array<GumX86Reg, 3> scratch{};
-    const bool can_inline = simple_address &&
+    const bool can_inline = scalar_address &&
                             choose_scratch_registers(descriptor, scratch);
 
     if (!can_inline) {
@@ -1922,8 +1952,7 @@ static void emit_memory_access(GumStalkerIterator *iterator,
     const auto overflow = static_cast<gconstpointer>(&cd->labels[3]);
     const auto original = static_cast<gconstpointer>(&cd->labels[4]);
     if (!pgas_x86_emit_range_gate(
-            writer,
-            cs_to_gum_reg(static_cast<x86_reg>(descriptor.base_register)),
+            writer, base, index, descriptor.scale,
             scratch[0], scratch[1], scratch[2], descriptor.displacement,
             descriptor.width, cd->pgas_base, cd->pgas_size, inside, outside,
             partial, overflow)) {
@@ -1932,22 +1961,22 @@ static void emit_memory_access(GumStalkerIterator *iterator,
 
     gum_x86_writer_put_label(writer, inside);
     emit_enveloped_callout(iterator, writer, cd, memory_pre_callout);
-    gum_x86_writer_put_jmp_near_label(writer, original);
-
-    gum_x86_writer_put_label(writer, outside);
+    gum_x86_writer_put_bytes(writer, descriptor.instruction_bytes.data(),
+                             descriptor.instruction_size);
+    emit_enveloped_callout(iterator, writer, cd, memory_post_callout);
     gum_x86_writer_put_jmp_near_label(writer, original);
 
     gum_x86_writer_put_label(writer, partial);
     emit_enveloped_callout(iterator, writer, cd, memory_pre_callout);
-    gum_x86_writer_put_breakpoint(writer);
+    gum_x86_writer_put_jmp_near_label(writer, outside);
 
     gum_x86_writer_put_label(writer, overflow);
     emit_enveloped_callout(iterator, writer, cd, memory_pre_callout);
-    gum_x86_writer_put_breakpoint(writer);
+    gum_x86_writer_put_jmp_near_label(writer, outside);
 
-    gum_x86_writer_put_label(writer, original);
+    gum_x86_writer_put_label(writer, outside);
     gum_stalker_iterator_keep(iterator);
-    emit_enveloped_callout(iterator, writer, cd, memory_post_callout);
+    gum_x86_writer_put_label(writer, original);
 }
 
 // ---------------------------------------------------------------------------
@@ -2547,11 +2576,11 @@ void append_bulk_values(std::string &output, const uint64_t values[4])
               std::to_string(values[PGAS_BULK_REP_STRING]) + "}";
 }
 
-void write_stdout(const std::string &output)
+void write_stderr(const std::string &output)
 {
     size_t offset{};
     while (offset < output.size()) {
-        const ssize_t written = write(STDOUT_FILENO, output.data() + offset,
+        const ssize_t written = write(STDERR_FILENO, output.data() + offset,
                                       output.size() - offset);
         if (written <= 0)
             return;
@@ -2728,7 +2757,7 @@ void pgas_stalker_print_json(
               std::to_string(ctx->stats.translated_unsupported) +
               "},\"strict_valid\":" + (strict_valid ? "true" : "false") +
               "}\n";
-    write_stdout(output);
+    write_stderr(output);
 }
 
 void pgas_stalker_finalize(pgas_stalker_ctx_t *ctx) {
@@ -3178,23 +3207,23 @@ void pgas_stalker_print_stats(pgas_stalker_ctx_t *ctx) {
     uint64_t total_hooked = s.mov_loads_hooked + s.mov_stores_hooked;
     uint64_t range_hits = s.remote_loads + s.remote_stores + s.local_passthrough;
 
-    printf("\n=== PGAS Stalker ARM64 Load/Store Statistics ===\n");
-    printf("JIT phase:\n");
-    printf("  Blocks transformed:   %lu\n", s.blocks_transformed);
-    printf("  Instructions scanned: %lu\n", s.insns_scanned);
-    printf("  Loads hooked:         %lu\n", s.mov_loads_hooked);
-    printf("  Stores hooked:        %lu\n", s.mov_stores_hooked);
-    printf("  Instrumentation rate: %.1f%%\n",
+    fprintf(stderr, "\n=== PGAS Stalker ARM64 Load/Store Statistics ===\n");
+    fprintf(stderr, "JIT phase:\n");
+    fprintf(stderr, "  Blocks transformed:   %lu\n", s.blocks_transformed);
+    fprintf(stderr, "  Instructions scanned: %lu\n", s.insns_scanned);
+    fprintf(stderr, "  Loads hooked:         %lu\n", s.mov_loads_hooked);
+    fprintf(stderr, "  Stores hooked:        %lu\n", s.mov_stores_hooked);
+    fprintf(stderr, "  Instrumentation rate: %.1f%%\n",
            s.insns_scanned ? 100.0 * total_hooked / s.insns_scanned : 0);
-    printf("Runtime:\n");
-    printf("  Callouts fired:       %lu\n", s.callouts_fired);
-    printf("  PGAS range hits:      %lu\n", range_hits);
-    printf("  Remote loads:         %lu\n", s.remote_loads);
-    printf("  Remote stores:        %lu\n", s.remote_stores);
-    printf("  Local passthrough:    %lu\n", s.local_passthrough);
-    printf("  Callout pool used:    %lu / %d\n",
+    fprintf(stderr, "Runtime:\n");
+    fprintf(stderr, "  Callouts fired:       %lu\n", s.callouts_fired);
+    fprintf(stderr, "  PGAS range hits:      %lu\n", range_hits);
+    fprintf(stderr, "  Remote loads:         %lu\n", s.remote_loads);
+    fprintf(stderr, "  Remote stores:        %lu\n", s.remote_stores);
+    fprintf(stderr, "  Local passthrough:    %lu\n", s.local_passthrough);
+    fprintf(stderr, "  Callout pool used:    %lu / %d\n",
            g_callout_pool_next, CALLOUT_POOL_CAPACITY);
-    printf("===============================================\n\n");
+    fprintf(stderr, "===============================================\n\n");
 }
 
 void pgas_stalker_print_json(

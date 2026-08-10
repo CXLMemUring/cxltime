@@ -185,9 +185,11 @@ nv_attach_impl::nv_attach_impl()
 		ctx->impl = this;
 		auto ctx_ptr = ctx.get();
 		this->hooker_contexts.push_back(std::move(ctx));
+		GumAttachOptions options{};
+		options.listener_function_data = ctx_ptr;
 		if (auto result = gum_interceptor_attach(
 			    interceptor, (gpointer)addr,
-			    (GumInvocationListener *)listener, ctx_ptr);
+			    (GumInvocationListener *)listener, &options);
 		    result != GUM_ATTACH_OK) {
 			SPDLOG_ERROR(
 				"Unable to attach to CUDA functions: func={}, err={}",
@@ -256,10 +258,12 @@ nv_attach_impl::nv_attach_impl()
 			GSIZE_TO_POINTER(gum_module_find_export_by_name(
 				nullptr, "cudaLaunchKernel"));
 
+		GumReplaceOptions options{};
+		options.replacement_data = this;
 		if (auto err = gum_interceptor_replace(
 			    interceptor, cuda_launch_kernel_addr,
 			    (gpointer)&cuda_runtime_function__cudaLaunchKernel,
-			    this, nullptr);
+			    nullptr, &options);
 		    err != GUM_REPLACE_OK) {
 			SPDLOG_ERROR("Unable to replace cudaLaunchKernel: {}",
 				     (int)err);

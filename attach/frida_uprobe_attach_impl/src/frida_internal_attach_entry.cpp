@@ -32,9 +32,11 @@ frida_internal_attach_entry::frida_internal_attach_entry(
 			(GumInvocationListener *)g_object_new(
 				uprobe_listener_get_type(), NULL);
 
+		GumAttachOptions options{};
+		options.listener_function_data = this;
 		if (int err = gum_interceptor_attach(
 			    interceptor, function,
-			    frida_gum_invocation_listener, this);
+			    frida_gum_invocation_listener, &options);
 		    err < 0) {
 			SPDLOG_ERROR(
 				"Failed to execute frida gum_interceptor_attach for function {:x}",
@@ -43,10 +45,12 @@ frida_internal_attach_entry::frida_internal_attach_entry(
 				"Failed to attach uprobe/uretprpbe");
 		}
 	} else if (basic_attach_type == ATTACH_UPROBE_OVERRIDE) {
+		GumReplaceOptions options{};
+		options.replacement_data = this;
 		if (int err = gum_interceptor_replace(
 			    interceptor, function,
 			    (void *)__bpftime_frida_attach_manager__override_handler,
-			    this, nullptr);
+			    nullptr, &options);
 		    err < 0) {
 			SPDLOG_ERROR(
 				"Failed to execute frida replace for function {:x}, when attaching filter, err={}",

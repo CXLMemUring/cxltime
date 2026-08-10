@@ -23,7 +23,9 @@ constexpr size_t node_size = 64 * 1024;
 
 struct transport_state {
     std::array<std::vector<uint8_t>, 3> nodes;
+    int reads{};
     int writes{};
+    int fail_read_number{};
     int fail_write_number{};
     transport_state()
     {
@@ -36,6 +38,9 @@ int transport_read(void *opaque, uint16_t node, uint64_t offset,
                    void *destination, size_t size)
 {
     auto &state = *static_cast<transport_state *>(opaque);
+    ++state.reads;
+    if (state.fail_read_number == state.reads)
+        return -EIO;
     if (node >= state.nodes.size() ||
         offset + size > state.nodes[node].size())
         return -ERANGE;
@@ -185,7 +190,7 @@ TEST_CASE("model mapper tracks overlapping views and rejects every bound",
     auto inventory = mapper.inventory();
     CHECK(inventory.views == 2);
     CHECK(inventory.mapped_bytes == 4 * page_size);
-    CHECK(inventory.seeded_bytes == 4 * page_size);
+    CHECK(inventory.seeded_bytes == 3 * page_size);
     CHECK(inventory.node1_model_bytes == 4 * page_size);
 
     CHECK(mapper.map_fd(selected.fd, page_size, 1, error) == nullptr);
@@ -199,6 +204,166 @@ TEST_CASE("model mapper tracks overlapping views and rejects every bound",
                              page_size, error));
     CHECK(error == EINVAL);
     CHECK(mapper.inventory().rejected_mappings == 3);
+}
+
+TEST_CASE("model mapper reports unique seeded file coverage",
+          "[pgas][model][mapping][coverage]")
+{
+    mapper_fixture fixture;
+    temporary_file selected(47);
+    pgas_model_mapper mapper;
+    const uint64_t arena =
+        reinterpret_cast<uint64_t>(fixture.shadow + node_size);
+    REQUIRE(mapper.configure({ selected.path, arena, 3 * page_size,
+                               page_size, page_size, fixture.runtime }) == 0);
+
+    int error{};
+    REQUIRE(mapper.map_fd(selected.fd, page_size, 0, error) ==
+            reinterpret_cast<void *>(arena));
+    REQUIRE(mapper.map_fd(selected.fd, page_size, 2 * page_size, error) ==
+            reinterpret_cast<void *>(arena + 2 * page_size));
+    CHECK(mapper.inventory().seeded_bytes == 2 * page_size);
+}
+
+TEST_CASE("model mapper refreshes active native shadow replicas",
+          "[pgas][model][mapping][refresh]")
+{
+    mapper_fixture fixture;
+    temporary_file selected(31);
+    pgas_model_mapper mapper;
+    const uint64_t arena =
+        reinterpret_cast<uint64_t>(fixture.shadow + node_size);
+    REQUIRE(mapper.configure({ selected.path, arena, 3 * page_size,
+                               page_size, page_size, fixture.runtime }) == 0);
+
+    int error{};
+    auto *mapped = static_cast<uint8_t *>(
+        mapper.map_fd(selected.fd, 2 * page_size, 0, error));
+    REQUIRE(mapped == reinterpret_cast<void *>(arena));
+
+    std::fill(fixture.transport.nodes[1].begin(),
+              fixture.transport.nodes[1].begin() + 2 * page_size, 0xa5);
+    std::memset(mapped, 0, 2 * page_size);
+    REQUIRE(mapper.refresh_all() == 0);
+    CHECK(std::all_of(mapped, mapped + 2 * page_size,
+                      [](uint8_t value) { return value == 0xa5; }));
+    auto inventory = mapper.inventory();
+    CHECK(inventory.refresh_calls == 1);
+    CHECK(inventory.refresh_requested_bytes == 2 * page_size);
+    CHECK(inventory.refreshed_bytes == 2 * page_size);
+    CHECK(inventory.refresh_failures == 0);
+
+    fixture.transport.fail_read_number = fixture.transport.reads + 1;
+    CHECK(mapper.refresh_all() == -EIO);
+    inventory = mapper.inventory();
+    CHECK(inventory.refresh_calls == 2);
+    CHECK(inventory.refresh_requested_bytes == 4 * page_size);
+    CHECK(inventory.refreshed_bytes == 2 * page_size);
+    CHECK(inventory.refresh_failures == 1);
+}
+
+TEST_CASE("model mapper refreshes overlapping replicas only once",
+          "[pgas][model][mapping][refresh][coverage]")
+{
+    mapper_fixture fixture;
+    temporary_file selected(37);
+    pgas_model_mapper mapper;
+    const uint64_t arena =
+        reinterpret_cast<uint64_t>(fixture.shadow + node_size);
+    REQUIRE(mapper.configure({ selected.path, arena, 3 * page_size,
+                               page_size, page_size, fixture.runtime }) == 0);
+
+    int error{};
+    REQUIRE(mapper.map_fd(selected.fd, 2 * page_size, 0, error) ==
+            reinterpret_cast<void *>(arena));
+    REQUIRE(mapper.map_fd(selected.fd, 2 * page_size, page_size, error) ==
+            reinterpret_cast<void *>(arena + page_size));
+    std::fill(fixture.transport.nodes[1].begin(),
+              fixture.transport.nodes[1].begin() + 3 * page_size, 0x6b);
+    std::memset(reinterpret_cast<void *>(arena), 0, 3 * page_size);
+
+    REQUIRE(mapper.refresh_all() == 0);
+    const auto inventory = mapper.inventory();
+    CHECK(inventory.refresh_requested_bytes == 3 * page_size);
+    CHECK(inventory.refreshed_bytes == 3 * page_size);
+    CHECK(std::all_of(reinterpret_cast<uint8_t *>(arena),
+                      reinterpret_cast<uint8_t *>(arena + 3 * page_size),
+                      [](uint8_t value) { return value == 0x6b; }));
+}
+
+TEST_CASE("model mapper trims and splits partial unmaps",
+          "[pgas][model][mapping][unmap]")
+{
+    mapper_fixture fixture;
+    temporary_file selected(59);
+    pgas_model_mapper mapper;
+    const uint64_t arena =
+        reinterpret_cast<uint64_t>(fixture.shadow + node_size);
+    REQUIRE(mapper.configure({ selected.path, arena, 3 * page_size,
+                               page_size, page_size, fixture.runtime }) == 0);
+
+    int error{};
+    REQUIRE(mapper.map_fd(selected.fd, 3 * page_size, 0, error) ==
+            reinterpret_cast<void *>(arena));
+    REQUIRE(mapper.unmap(reinterpret_cast<void *>(arena + page_size),
+                         page_size, error));
+    CHECK(mapper.inventory().views == 2);
+    CHECK(mapper.inventory().mapped_bytes == 2 * page_size);
+    CHECK(mapper.inventory().node1_model_bytes == 2 * page_size);
+
+    REQUIRE(mapper.unmap(reinterpret_cast<void *>(arena), page_size, error));
+    REQUIRE(mapper.unmap(reinterpret_cast<void *>(arena + 2 * page_size),
+                         page_size, error));
+    CHECK(mapper.inventory().views == 0);
+    CHECK(mapper.inventory().mapped_bytes == 0);
+    CHECK(mapper.inventory().seeded_bytes == 3 * page_size);
+}
+
+TEST_CASE("model mapper rounds munmap length to Linux page granularity",
+          "[pgas][model][mapping][unmap][pages]")
+{
+    mapper_fixture fixture;
+    temporary_file selected(61);
+    pgas_model_mapper mapper;
+    const uint64_t arena =
+        reinterpret_cast<uint64_t>(fixture.shadow + node_size);
+    REQUIRE(mapper.configure({ selected.path, arena, 3 * page_size,
+                               page_size, page_size, fixture.runtime }) == 0);
+
+    int error{};
+    REQUIRE(mapper.map_fd(selected.fd, 3 * page_size, 0, error) ==
+            reinterpret_cast<void *>(arena));
+    REQUIRE(mapper.unmap(reinterpret_cast<void *>(arena), 1, error));
+    CHECK(mapper.inventory().mapped_bytes == 2 * page_size);
+    CHECK(mapper.inventory().views == 1);
+    REQUIRE(mapper.unmap(reinterpret_cast<void *>(arena + page_size),
+                         2 * page_size, error));
+    CHECK(mapper.inventory().mapped_bytes == 0);
+}
+
+TEST_CASE("model mapper unmaps across adjacent views and holes",
+          "[pgas][model][mapping][unmap][ranges]")
+{
+    mapper_fixture fixture;
+    temporary_file selected(63);
+    pgas_model_mapper mapper;
+    const uint64_t arena =
+        reinterpret_cast<uint64_t>(fixture.shadow + node_size);
+    REQUIRE(mapper.configure({ selected.path, arena, 3 * page_size,
+                               page_size, page_size, fixture.runtime }) == 0);
+
+    int error{};
+    REQUIRE(mapper.map_fd(selected.fd, page_size, 0, error) ==
+            reinterpret_cast<void *>(arena));
+    REQUIRE(mapper.map_fd(selected.fd, page_size, 2 * page_size, error) ==
+            reinterpret_cast<void *>(arena + 2 * page_size));
+    REQUIRE(mapper.unmap(reinterpret_cast<void *>(arena + page_size),
+                         page_size, error));
+    CHECK(mapper.inventory().views == 2);
+    REQUIRE(mapper.unmap(reinterpret_cast<void *>(arena),
+                         3 * page_size, error));
+    CHECK(mapper.inventory().views == 0);
+    CHECK(mapper.inventory().mapped_bytes == 0);
 }
 
 TEST_CASE("model mapper rejects overflowing and insufficient arenas",
@@ -251,7 +416,7 @@ TEST_CASE("model mapper preserves configuration and poisons partial seeding",
     const auto inventory = mapper.inventory();
     CHECK(inventory.views == 0);
     CHECK(inventory.mapped_bytes == 0);
-    CHECK(inventory.seeded_bytes == 2 * page_size);
+    CHECK(inventory.seeded_bytes == page_size);
     CHECK(mapper.map_fd(selected.fd, page_size, 0, error) == nullptr);
     CHECK(error == EIO);
 }

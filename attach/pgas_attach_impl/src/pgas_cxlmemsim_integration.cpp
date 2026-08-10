@@ -384,19 +384,19 @@ uint64_t pgas_cxlmemsim_hooker::translate_addr(uint64_t local_addr,
 void pgas_cxlmemsim_hooker::print_stats() const {
     auto stats = cxlmemsim_connection_manager::instance().get_stats();
 
-    printf("\n=== PGAS CXLMemSim Hook Statistics ===\n");
-    printf("Local reads:  %lu\n", stats.local_reads);
-    printf("Local writes: %lu\n", stats.local_writes);
-    printf("Remote reads:  %lu\n", stats.remote_reads);
-    printf("Remote writes: %lu\n", stats.remote_writes);
-    printf("Total remote latency: %lu ns\n", stats.total_remote_latency_ns);
+    fprintf(stderr, "\n=== PGAS CXLMemSim Hook Statistics ===\n");
+    fprintf(stderr, "Local reads:  %lu\n", stats.local_reads);
+    fprintf(stderr, "Local writes: %lu\n", stats.local_writes);
+    fprintf(stderr, "Remote reads:  %lu\n", stats.remote_reads);
+    fprintf(stderr, "Remote writes: %lu\n", stats.remote_writes);
+    fprintf(stderr, "Total remote latency: %lu ns\n", stats.total_remote_latency_ns);
 
     uint64_t total_remote = stats.remote_reads + stats.remote_writes;
     if (total_remote > 0) {
-        printf("Avg remote latency: %lu ns\n",
+        fprintf(stderr, "Avg remote latency: %lu ns\n",
                stats.total_remote_latency_ns / total_remote);
     }
-    printf("======================================\n\n");
+    fprintf(stderr, "======================================\n\n");
 }
 
 // ============================================================================

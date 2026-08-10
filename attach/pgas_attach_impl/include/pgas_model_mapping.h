@@ -16,11 +16,16 @@ struct pgas_model_inventory_c {
     uint64_t node1_model_bytes;
     uint64_t rejected_mappings;
     uint64_t dram_fallbacks;
+    uint64_t refresh_calls;
+    uint64_t refresh_requested_bytes;
+    uint64_t refreshed_bytes;
+    uint64_t refresh_failures;
     uint32_t views;
 };
 
 void *pgas_model_map(int fd, size_t length, off_t offset, int *error_out);
 int pgas_model_unmap(void *address, size_t length);
+int pgas_model_refresh_all(void);
 int pgas_model_get_inventory(struct pgas_model_inventory_c *out);
 
 #ifdef __cplusplus

@@ -174,7 +174,8 @@ void pgas_stalker_finalize(pgas_stalker_ctx_t *ctx);
 namespace bpftime::attach {
 
 bool pgas_x86_emit_range_gate(GumX86Writer *writer,
-                              GumX86Reg address_register,
+                              GumX86Reg base_register,
+                              GumX86Reg index_register, uint8_t scale,
                               GumX86Reg scratch_start,
                               GumX86Reg scratch_end,
                               GumX86Reg scratch_bound, int64_t displacement,

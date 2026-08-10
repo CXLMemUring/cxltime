@@ -34,6 +34,43 @@ uint64_t overlap_size(uint64_t begin, uint64_t end,
     return high > low ? high - low : 0;
 }
 
+bool merge_interval(std::vector<pgas_model_interval> &intervals,
+                    uint64_t begin, uint64_t length)
+{
+    uint64_t end{};
+    if (length == 0 || add_overflow(begin, length, end))
+        return false;
+    intervals.push_back({ begin, end });
+    std::sort(intervals.begin(), intervals.end(),
+              [](const auto &left, const auto &right) {
+                  return left.begin < right.begin ||
+                         (left.begin == right.begin && left.end < right.end);
+              });
+    size_t output = 0;
+    for (const auto &interval : intervals) {
+        if (output == 0 || intervals[output - 1].end < interval.begin) {
+            intervals[output++] = interval;
+        } else {
+            intervals[output - 1].end =
+                std::max(intervals[output - 1].end, interval.end);
+        }
+    }
+    intervals.resize(output);
+    return true;
+}
+
+bool interval_bytes(const std::vector<pgas_model_interval> &intervals,
+                    uint64_t &total)
+{
+    total = 0;
+    for (const auto &interval : intervals) {
+        const uint64_t length = interval.end - interval.begin;
+        if (add_overflow(total, length, total))
+            return false;
+    }
+    return true;
+}
+
 } // namespace
 
 int pgas_model_mapper::configure(const pgas_model_mapping_config &config)
@@ -82,6 +119,7 @@ int pgas_model_mapper::configure(const pgas_model_mapping_config &config)
     inode_ = file_status.st_ino;
     file_size_ = static_cast<uint64_t>(file_status.st_size);
     inventory_ = {};
+    seeded_intervals_.clear();
     poisoned_ = false;
     configured_ = true;
     return 0;
@@ -152,6 +190,21 @@ bool pgas_model_mapper::account_view_locked(uint64_t address,
     return true;
 }
 
+bool pgas_model_mapper::account_seeded_locked(uint64_t offset,
+                                              uint64_t length)
+{
+    if (length == 0)
+        return true;
+    auto intervals = seeded_intervals_;
+    uint64_t total{};
+    if (!merge_interval(intervals, offset, length) ||
+        !interval_bytes(intervals, total))
+        return false;
+    seeded_intervals_ = std::move(intervals);
+    inventory_.seeded_bytes = total;
+    return true;
+}
+
 void *pgas_model_mapper::map_fd(int fd, size_t length, off_t offset,
                                 int &error)
 {
@@ -204,13 +257,12 @@ void *pgas_model_mapper::map_fd(int fd, size_t length, off_t offset,
         return existing->address;
     }
     if (inventory_.views == UINT32_MAX ||
-        length > UINT64_MAX - inventory_.seeded_bytes ||
         !account_view_locked(address, length, true)) {
         reject_locked(EOVERFLOW, error);
         return nullptr;
     }
-    // Reserve inventory atomically before any remote mutation.  Roll it back
-    // on failure; seeded_bytes is published only after the entire view lands.
+    // Validate inventory capacity before any remote mutation.  seeded_bytes
+    // records merged, verified file coverage even when a later chunk fails.
     account_view_locked(address, length, false);
 
     // Validate the complete file interval before publishing its first chunk.
@@ -249,7 +301,8 @@ void *pgas_model_mapper::map_fd(int fd, size_t length, off_t offset,
                 continue;
             if (count <= 0) {
                 poisoned_ = true;
-                inventory_.seeded_bytes += completed;
+                account_seeded_locked(static_cast<uint64_t>(offset),
+                                      completed);
                 reject_locked(count == 0 ? EIO : errno, error);
                 return nullptr;
             }
@@ -260,8 +313,15 @@ void *pgas_model_mapper::map_fd(int fd, size_t length, off_t offset,
             seed_buffer.data(), chunk);
         if (result != 0) {
             poisoned_ = true;
-            inventory_.seeded_bytes += completed;
+            account_seeded_locked(static_cast<uint64_t>(offset), completed);
             reject_locked(result < 0 ? -result : result, error);
+            return nullptr;
+        }
+        if (std::memcmp(reinterpret_cast<const void *>(address + completed),
+                        seed_buffer.data(), chunk) != 0) {
+            poisoned_ = true;
+            account_seeded_locked(static_cast<uint64_t>(offset), completed);
+            reject_locked(EIO, error);
             return nullptr;
         }
         completed += chunk;
@@ -270,8 +330,8 @@ void *pgas_model_mapper::map_fd(int fd, size_t length, off_t offset,
     views_.push_back({ device_, inode_, offset, length,
                        reinterpret_cast<void *>(address), 1 });
     ++inventory_.views;
-    inventory_.seeded_bytes += length;
-    if (!account_view_locked(address, length, true)) {
+    if (!account_seeded_locked(static_cast<uint64_t>(offset), length) ||
+        !account_view_locked(address, length, true)) {
         views_.pop_back();
         --inventory_.views;
         poisoned_ = true;
@@ -285,25 +345,137 @@ bool pgas_model_mapper::unmap(void *address, size_t length, int &error)
 {
     std::lock_guard guard(mutex_);
     error = 0;
-    const auto view = std::find_if(
-        views_.begin(), views_.end(), [&](const pgas_model_view &candidate) {
-            return candidate.address == address && candidate.length == length;
-        });
-    if (view == views_.end()) {
+    const uint64_t unmap_begin = reinterpret_cast<uint64_t>(address);
+    uint64_t requested_end{};
+    uint64_t rounded_length{};
+    if (!configured_ || length == 0 ||
+        (unmap_begin & (config_.page_size - 1)) != 0 ||
+        add_overflow(unmap_begin, length, requested_end) ||
+        add_overflow(static_cast<uint64_t>(length), config_.page_size - 1,
+                     rounded_length)) {
         error = EINVAL;
         return false;
     }
-    if (--view->references != 0)
+    rounded_length &= ~(static_cast<uint64_t>(config_.page_size) - 1);
+    uint64_t rounded_end{};
+    if (add_overflow(unmap_begin, rounded_length, rounded_end)) {
+        error = EINVAL;
+        return false;
+    }
+
+    const auto exact = std::find_if(
+        views_.begin(), views_.end(), [&](const pgas_model_view &candidate) {
+            return candidate.address == address && candidate.length == length;
+        });
+    if (exact != views_.end() && exact->references > 1) {
+        --exact->references;
         return true;
-    if (!account_view_locked(reinterpret_cast<uint64_t>(view->address),
-                             view->length, false)) {
+    }
+
+    struct removed_interval {
+        uint64_t begin;
+        uint64_t length;
+    };
+    std::vector<pgas_model_view> remaining;
+    std::vector<removed_interval> removed;
+    remaining.reserve(views_.size() * 2);
+    removed.reserve(views_.size());
+    for (const auto &view : views_) {
+        const uint64_t view_begin = reinterpret_cast<uint64_t>(view.address);
+        uint64_t view_end{};
+        if (add_overflow(view_begin, view.length, view_end)) {
+            error = EOVERFLOW;
+            poisoned_ = true;
+            return false;
+        }
+        const uint64_t overlap_begin = std::max(view_begin, unmap_begin);
+        const uint64_t overlap_end = std::min(view_end, rounded_end);
+        if (overlap_begin >= overlap_end) {
+            remaining.push_back(view);
+            continue;
+        }
+
+        removed.push_back({ overlap_begin, overlap_end - overlap_begin });
+        const uint64_t prefix_length = overlap_begin - view_begin;
+        const uint64_t suffix_length = view_end - overlap_end;
+        if (prefix_length != 0) {
+            remaining.push_back({ view.device, view.inode, view.offset,
+                                  static_cast<size_t>(prefix_length),
+                                  view.address, view.references });
+        }
+        if (suffix_length != 0) {
+            remaining.push_back({
+                view.device, view.inode,
+                view.offset + static_cast<off_t>(overlap_end - view_begin),
+                static_cast<size_t>(suffix_length),
+                reinterpret_cast<void *>(overlap_end), view.references
+            });
+        }
+    }
+    if (remaining.size() > UINT32_MAX) {
         error = EOVERFLOW;
         poisoned_ = true;
         return false;
     }
-    views_.erase(view);
-    --inventory_.views;
+    for (const auto &interval : removed) {
+        if (!account_view_locked(interval.begin, interval.length, false)) {
+            error = EOVERFLOW;
+            poisoned_ = true;
+            return false;
+        }
+    }
+    views_ = std::move(remaining);
+    inventory_.views = static_cast<uint32_t>(views_.size());
     return true;
+}
+
+int pgas_model_mapper::refresh_all()
+{
+    std::lock_guard guard(mutex_);
+    if (!configured_ || poisoned_)
+        return -EIO;
+    if (inventory_.refresh_calls != UINT64_MAX)
+        ++inventory_.refresh_calls;
+
+    std::vector<pgas_model_interval> intervals;
+    for (const auto &view : views_) {
+        if (!merge_interval(intervals,
+                            reinterpret_cast<uint64_t>(view.address),
+                            static_cast<uint64_t>(view.length))) {
+            if (inventory_.refresh_failures != UINT64_MAX)
+                ++inventory_.refresh_failures;
+            return -EOVERFLOW;
+        }
+    }
+    uint64_t requested{};
+    if (!interval_bytes(intervals, requested) ||
+        requested > UINT64_MAX - inventory_.refresh_requested_bytes) {
+        if (inventory_.refresh_failures != UINT64_MAX)
+            ++inventory_.refresh_failures;
+        return -EOVERFLOW;
+    }
+    inventory_.refresh_requested_bytes += requested;
+
+    uint64_t completed = 0;
+    for (const auto &interval : intervals) {
+        const uint64_t length = interval.end - interval.begin;
+        const int result = pgas_x86_bulk_refresh(
+            config_.runtime, reinterpret_cast<void *>(interval.begin),
+            static_cast<size_t>(length));
+        if (result != 0) {
+            if (inventory_.refresh_failures != UINT64_MAX)
+                ++inventory_.refresh_failures;
+            return result;
+        }
+        if (__builtin_add_overflow(completed, length, &completed) ||
+            completed > UINT64_MAX - inventory_.refreshed_bytes) {
+            if (inventory_.refresh_failures != UINT64_MAX)
+                ++inventory_.refresh_failures;
+            return -EOVERFLOW;
+        }
+    }
+    inventory_.refreshed_bytes += completed;
+    return 0;
 }
 
 pgas_model_inventory pgas_model_mapper::inventory() const
@@ -339,6 +511,11 @@ int pgas_model_unmap(void *address, size_t length)
         address, length, error) ? 0 : -error;
 }
 
+int pgas_model_refresh_all(void)
+{
+    return bpftime::attach::pgas_global_model_mapper().refresh_all();
+}
+
 int pgas_model_get_inventory(struct pgas_model_inventory_c *out)
 {
     if (out == nullptr)
@@ -348,7 +525,9 @@ int pgas_model_get_inventory(struct pgas_model_inventory_c *out)
     *out = { inventory.mapped_bytes, inventory.seeded_bytes,
              inventory.node0_model_bytes, inventory.node1_model_bytes,
              inventory.rejected_mappings, inventory.dram_fallbacks,
-             inventory.views };
+             inventory.refresh_calls, inventory.refresh_requested_bytes,
+             inventory.refreshed_bytes,
+             inventory.refresh_failures, inventory.views };
     return 0;
 }
 

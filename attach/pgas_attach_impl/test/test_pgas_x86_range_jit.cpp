@@ -5,13 +5,16 @@
 
 #include <array>
 #include <cstdint>
+#include <sys/mman.h>
+#include <tuple>
+#include <unistd.h>
 #include <utility>
 
 using namespace bpftime::attach;
 
 namespace {
 
-using range_function = int (*)(uint64_t);
+using range_function = int (*)(uint64_t, uint64_t);
 
 struct call_state {
     int result{};
@@ -22,7 +25,8 @@ struct call_state {
     uint64_t red_zone{};
 };
 
-call_state call_preserving_state(range_function function, uint64_t address)
+call_state call_preserving_state(range_function function, uint64_t base,
+                                 uint64_t index)
 {
     constexpr uint64_t sentinel_r10 = 0x1010101010101010ULL;
     constexpr uint64_t sentinel_r11 = 0x1111111111111111ULL;
@@ -33,7 +37,8 @@ call_state call_preserving_state(range_function function, uint64_t address)
 
     asm volatile(
         "mov %[function], %%r13\n\t"
-        "mov %[address], %%rdi\n\t"
+        "mov %[base], %%rdi\n\t"
+        "mov %[index], %%rsi\n\t"
         "mov %[sentinel_r10], %%r10\n\t"
         "mov %[sentinel_r11], %%r11\n\t"
         "mov %[sentinel_r12], %%r12\n\t"
@@ -56,13 +61,15 @@ call_state call_preserving_state(range_function function, uint64_t address)
         : [result] "=m"(state.result), [flags] "=m"(state.flags),
           [r10] "=m"(state.r10), [r11] "=m"(state.r11),
           [r12] "=m"(state.r12), [red_zone] "=m"(state.red_zone)
-        : [function] "r"(function), [address] "r"(address),
-          [sentinel_r10] "r"(sentinel_r10),
-          [sentinel_r11] "r"(sentinel_r11),
-          [sentinel_r12] "r"(sentinel_r12),
-          [input_flags] "r"(input_flags),
-          [red_zone_sentinel] "r"(red_zone_sentinel)
-        : "rax", "rdi", "r10", "r11", "r12", "r13", "memory", "cc");
+        : [function] "m"(function), [base] "m"(base),
+          [index] "m"(index),
+          [sentinel_r10] "m"(sentinel_r10),
+          [sentinel_r11] "m"(sentinel_r11),
+          [sentinel_r12] "m"(sentinel_r12),
+          [input_flags] "m"(input_flags),
+          [red_zone_sentinel] "m"(red_zone_sentinel)
+        : "rax", "rdi", "rsi", "r10", "r11", "r12", "r13", "memory",
+          "cc");
 
     return state;
 }
@@ -82,8 +89,13 @@ TEST_CASE("generated x86 range gate preserves 64-bit bounds and state",
     constexpr uint64_t red_zone_sentinel = 0xfeedfacecafebeefULL;
 
     gum_init_embedded();
-    auto *code = static_cast<uint8_t *>(gum_alloc_n_pages(1, GUM_PAGE_RWX));
-    REQUIRE(code != nullptr);
+    const long system_page_size = sysconf(_SC_PAGESIZE);
+    REQUIRE(system_page_size > 0);
+    auto *code = static_cast<uint8_t *>(mmap(
+        nullptr, static_cast<size_t>(system_page_size),
+        PROT_READ | PROT_WRITE | PROT_EXEC,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(code != MAP_FAILED);
 
     GumX86Writer writer;
     gum_x86_writer_init(&writer, code);
@@ -93,7 +105,8 @@ TEST_CASE("generated x86 range gate preserves 64-bit bounds and state",
     static const char overflow_label{};
 
     REQUIRE(pgas_x86_emit_range_gate(
-        &writer, GUM_X86_RDI, GUM_X86_R10, GUM_X86_R11, GUM_X86_R12, 0, 8,
+        &writer, GUM_X86_RDI, GUM_X86_RSI, 4, GUM_X86_R10, GUM_X86_R11,
+        GUM_X86_R12, 16, 8,
         base, size, &inside_label, &outside_label, &partial_label,
         &overflow_label));
 
@@ -112,18 +125,23 @@ TEST_CASE("generated x86 range gate preserves 64-bit bounds and state",
     REQUIRE(gum_x86_writer_flush(&writer));
 
     const auto function = reinterpret_cast<range_function>(code);
-    const std::array<std::pair<uint64_t, int>, 7> cases{
-        std::pair{ base - 8, 0 },
-        std::pair{ base - 4, 2 },
-        std::pair{ base, 1 },
-        std::pair{ base + size - 8, 1 },
-        std::pair{ base + size - 4, 2 },
-        std::pair{ base + size, 0 },
-        std::pair{ UINT64_MAX - 3, 3 },
+    const std::array<std::tuple<uint64_t, uint64_t, int>, 9> cases{
+        std::tuple{ base - 24, UINT64_C(0), 0 },
+        std::tuple{ base - 20, UINT64_C(0), 2 },
+        std::tuple{ base - 16, UINT64_C(0), 1 },
+        std::tuple{ base + size - 24, UINT64_C(0), 1 },
+        std::tuple{ base + size - 20, UINT64_C(0), 2 },
+        std::tuple{ base + size - 16, UINT64_C(0), 0 },
+        std::tuple{ UINT64_MAX - 19, UINT64_C(0), 3 },
+        std::tuple{ base - 28, UINT64_C(3), 1 },
+        // A negative signed index encoded in a GPR must retain x86's modular
+        // address arithmetic: (base - 12) + (-1 * 4) + 16 == base.
+        std::tuple{ base - 12, UINT64_MAX, 1 },
     };
 
-    for (const auto &[address, expected] : cases) {
-        const auto state = call_preserving_state(function, address);
+    for (const auto &[address_base, address_index, expected] : cases) {
+        const auto state = call_preserving_state(
+            function, address_base, address_index);
         REQUIRE(state.result == expected);
         REQUIRE(state.r10 == sentinel_r10);
         REQUIRE(state.r11 == sentinel_r11);
@@ -134,6 +152,6 @@ TEST_CASE("generated x86 range gate preserves 64-bit bounds and state",
     }
 
     gum_x86_writer_clear(&writer);
-    gum_free_pages(code);
+    REQUIRE(munmap(code, static_cast<size_t>(system_page_size)) == 0);
     gum_deinit_embedded();
 }

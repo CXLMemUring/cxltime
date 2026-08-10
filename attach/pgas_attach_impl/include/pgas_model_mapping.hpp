@@ -31,6 +31,11 @@ struct pgas_model_view {
     uint32_t references{};
 };
 
+struct pgas_model_interval {
+    uint64_t begin{};
+    uint64_t end{};
+};
+
 struct pgas_model_inventory {
     uint64_t mapped_bytes{};
     uint64_t seeded_bytes{};
@@ -38,6 +43,10 @@ struct pgas_model_inventory {
     uint64_t node1_model_bytes{};
     uint64_t rejected_mappings{};
     uint64_t dram_fallbacks{};
+    uint64_t refresh_calls{};
+    uint64_t refresh_requested_bytes{};
+    uint64_t refreshed_bytes{};
+    uint64_t refresh_failures{};
     uint32_t views{};
 };
 
@@ -47,12 +56,14 @@ class pgas_model_mapper {
     bool matches_fd(int fd) const;
     void *map_fd(int fd, size_t length, off_t offset, int &error);
     bool unmap(void *address, size_t length, int &error);
+    int refresh_all();
     pgas_model_inventory inventory() const;
 
   private:
     bool matches_fd_locked(int fd) const;
     void reject_locked(int error, int &error_out);
     bool account_view_locked(uint64_t address, uint64_t length, bool add);
+    bool account_seeded_locked(uint64_t offset, uint64_t length);
 
     mutable std::mutex mutex_;
     pgas_model_mapping_config config_{};
@@ -63,6 +74,7 @@ class pgas_model_mapper {
     bool configured_{};
     bool poisoned_{};
     std::vector<pgas_model_view> views_;
+    std::vector<pgas_model_interval> seeded_intervals_;
     pgas_model_inventory inventory_{};
 };
 

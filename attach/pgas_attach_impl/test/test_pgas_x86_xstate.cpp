@@ -9,11 +9,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <vector>
 
 using namespace bpftime::attach;
 
 namespace {
+
+struct gum_test_runtime {
+    gum_test_runtime() { gum_init_embedded(); }
+    ~gum_test_runtime() { gum_deinit_embedded(); }
+};
+
+gum_test_runtime gum_runtime;
 
 pgas_x86_xstate_layout avx512_layout()
 {
@@ -147,22 +156,29 @@ TEST_CASE("xstate envelope emits xsave64 and xrstor64",
 {
     pgas_x86_xstate_layout layout{};
     REQUIRE(pgas_x86_detect_xstate(layout) == 0);
-    std::array<uint8_t, 512> code{};
+    const long system_page_size = sysconf(_SC_PAGESIZE);
+    REQUIRE(system_page_size > 0);
+    auto *code = static_cast<uint8_t *>(mmap(
+        nullptr, static_cast<size_t>(system_page_size),
+        PROT_READ | PROT_WRITE | PROT_EXEC,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(code != MAP_FAILED);
     GumX86Writer writer;
-    gum_x86_writer_init(&writer, code.data());
+    gum_x86_writer_init(&writer, code);
     pgas_x86_state_frame frame{};
     REQUIRE(pgas_x86_emit_state_save(&writer, layout, GUM_X86_R11, frame));
     REQUIRE(pgas_x86_emit_state_restore(&writer, layout, frame));
     gum_x86_writer_put_ret(&writer);
     REQUIRE(gum_x86_writer_flush(&writer));
 
-    const auto end = code.begin() + gum_x86_writer_offset(&writer);
+    const auto end = code + gum_x86_writer_offset(&writer);
     const std::array<uint8_t, 4> xsave{ 0x49, 0x0f, 0xae, 0x23 };
     const std::array<uint8_t, 4> xrstor{ 0x49, 0x0f, 0xae, 0x2b };
-    REQUIRE(std::search(code.begin(), end, xsave.begin(), xsave.end()) != end);
-    REQUIRE(std::search(code.begin(), end, xrstor.begin(), xrstor.end()) !=
+    REQUIRE(std::search(code, end, xsave.begin(), xsave.end()) != end);
+    REQUIRE(std::search(code, end, xrstor.begin(), xrstor.end()) !=
             end);
     gum_x86_writer_clear(&writer);
+    REQUIRE(munmap(code, static_cast<size_t>(system_page_size)) == 0);
 }
 
 #if defined(__x86_64__)
@@ -179,9 +195,13 @@ TEST_CASE("live envelope preserves flags zmm and opmask across a clobber",
 
     pgas_x86_xstate_layout layout{};
     REQUIRE(pgas_x86_detect_xstate(layout) == 0);
-    gum_init_embedded();
-    auto *code = static_cast<uint8_t *>(gum_alloc_n_pages(1, GUM_PAGE_RWX));
-    REQUIRE(code != nullptr);
+    const long system_page_size = sysconf(_SC_PAGESIZE);
+    REQUIRE(system_page_size > 0);
+    auto *code = static_cast<uint8_t *>(mmap(
+        nullptr, static_cast<size_t>(system_page_size),
+        PROT_READ | PROT_WRITE | PROT_EXEC,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(code != MAP_FAILED);
     GumX86Writer writer;
     gum_x86_writer_init(&writer, code);
     pgas_x86_state_frame frame{};
@@ -220,7 +240,6 @@ TEST_CASE("live envelope preserves flags zmm and opmask across a clobber",
     REQUIRE((actual_flags & arithmetic_flags) ==
             (input_flags & arithmetic_flags));
     gum_x86_writer_clear(&writer);
-    gum_free_pages(code);
-    gum_deinit_embedded();
+    REQUIRE(munmap(code, static_cast<size_t>(system_page_size)) == 0);
 }
 #endif

@@ -29,7 +29,8 @@ extern "C" void *pgas_memmove_override_handler();
 extern "C" void *pgas_memset_override_handler();
 
 // Note: original function pointers are now obtained from Frida's
-// gum_interceptor_replace() 5th parameter (stored in entry->orig_function)
+// gum_interceptor_replace() original_function output (stored in
+// entry->orig_function)
 // instead of dlsym, which would return the hooked address and cause recursion.
 
 // Frida listener interface - use simple struct approach like frida_uprobe_attach_impl
@@ -643,8 +644,10 @@ pgas_internal_attach_entry* pgas_attach_impl::get_or_create_internal_entry(
     // bypassing the Frida trampoline. This is critical to avoid infinite
     // recursion when the override handler calls the original.
     gpointer orig_func = nullptr;
+    GumReplaceOptions options{};
+    options.replacement_data = entry.get();
     gum_interceptor_replace(interceptor, addr, handler,
-                            entry.get(), &orig_func);
+                            &orig_func, &options);
     entry->orig_function = orig_func;
     SPDLOG_INFO("Captured original function at {} (hook at {}, op={})",
                 orig_func, addr, (int)op_type);
